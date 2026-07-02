@@ -20,11 +20,11 @@ Additional research credit to **Michael / DeFlockJoplin** for the **wildcard-pro
 
 ## What this branch does
 
-Turns a Seeed XIAO ESP32-S3 into a passive WiFi receiver that watches 2.4 GHz management and data frames for Flock Safety MAC OUIs. No AP, no transmit — the radio stays dedicated to sniffing while the device hops channels 1 / 6 / 11 at 350 ms dwell.
+Turns a Lonely Binary ESP32-S3 "Gold Edition" into a passive WiFi receiver that watches 2.4 GHz management and data frames for Flock Safety MAC OUIs. No AP, no transmit — the radio stays dedicated to sniffing while the device hops channels 1 / 6 / 11 at 350 ms dwell.
 
 Every detection is:
 
-- beeped (piezo on GPIO3) and flashed (onboard LED on GPIO21)
+- beeped (external piezo on GPIO4) and flashed on the onboard WS2812 RGB LED (GPIO48), color-coded by detection class
 - written to on-device SPIFFS in an atomic CRC-envelope format, surviving power loss
 - emitted as one JSON line over USB CDC in the schema `api/flockyou.py` expects, so the Flask dashboard auto-ingests it with GPS temporal matching
 
@@ -189,13 +189,24 @@ Open `http://localhost:5000`, pick your serial port from the UI, detections star
 
 ## Hardware
 
-**Board:** Seeed Studio XIAO ESP32-S3
+**Board:** Lonely Binary ESP32-S3 "Gold Edition" (N16R8 — 16 MB flash, 8 MB OPI PSRAM, onboard WS2812 RGB LED, native dual USB-C). Builds on the stock `esp32-s3-devkitc-1` profile with 16 MB flash + OPI PSRAM overrides in `platformio.ini` (the 6.x espressif32 platform doesn't ship a dedicated N16R8 profile).
 
 | Pin | Function |
 |-----|----------|
-| GPIO 3 | Piezo buzzer |
-| GPIO 21 | Onboard user LED (active low) |
-| GPIO 43 | Serial1 TX mirror (115200 baud) |
+| GPIO 4 | External piezo buzzer |
+| GPIO 48 | Onboard WS2812 RGB LED (addressable NeoPixel) |
+| GPIO 43 | Serial1 TX mirror (115200 baud) — U0TXD header pin |
+
+The RGB LED encodes the detection class as color:
+
+| Color | Detection |
+|-------|-----------|
+| 🔴 Red | Wildcard probe (high-precision DeFlockJoplin signature) |
+| 🟠 Amber | Transmitter-side OUI (`addr2`) |
+| 🔵 Blue | Receiver-side sleeper catch (`addr1`) |
+| 🟦 Cyan | BSSID fallback (`addr3`) |
+| 🟣 Magenta | SSID keyword |
+| 🟢 Green | Boot / startup |
 
 Boot sound: first 6 notes of Super Mario Bros. World 1-2 (underground).
 
@@ -211,7 +222,7 @@ pio run -t upload           # flash
 pio device monitor          # serial output
 ```
 
-`platformio.ini` and `partitions.csv` are at the root (1.9 MB SPIFFS partition, 6 MB app). No extra libraries needed beyond the Arduino-ESP32 core that ships with the espressif32 platform.
+`platformio.ini` and `partitions.csv` are at the root (16 MB flash layout: 6 MB app, ~9.9 MB SPIFFS). No extra libraries needed — the WS2812 is driven by the Arduino-ESP32 core's built-in `rgbLedWrite()`, so nothing beyond the core that ships with the espressif32 platform is required.
 
 ---
 
@@ -230,8 +241,9 @@ pio device monitor          # serial output
 | `PROCESS_DATA_FRAMES` | 1 | Data frames (where addr1 catch shines) |
 | `MAX_DETECTIONS` | 200 | On-device table cap |
 | `AUTOSAVE_INTERVAL_MS` | 60000 | SPIFFS save cadence |
-| `LED_PIN` | 21 | Onboard user LED |
-| `BUZZER_PIN` | 3 | Piezo |
+| `LED_PIN` | 48 | Onboard WS2812 RGB LED |
+| `LED_BRIGHTNESS` | 64 | Per-channel ceiling (0-255) for the WS2812 |
+| `BUZZER_PIN` | 4 | External piezo |
 
 ---
 

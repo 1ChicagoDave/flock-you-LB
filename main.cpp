@@ -9,18 +9,24 @@
 // CONFIG
 // ============================================================
 
-#define BUZZER_PIN 3
+// External piezo buzzer. GPIO4 is a plain, non-strapping, header-exposed pin on
+// the Lonely Binary ESP32-S3 "Gold Edition" — safe to drive at boot (the old
+// XIAO GPIO3 is an ESP32-S3 strapping pin, so we moved off it).
+#define BUZZER_PIN 4
 #define USE_BUZZER 1
 
-// Onboard user LED on Seeed XIAO ESP32-S3 is GPIO21 and is ACTIVE LOW
-// (driving the pin LOW lights the LED).
-#define LED_PIN          21
+// Onboard WS2812 RGB LED on the "Gold Edition" is a single addressable
+// NeoPixel on GPIO48. It's driven through the Arduino-ESP32 core's built-in
+// rgbLedWrite() (RMT-backed) — no external LED library needed. Detection class
+// is encoded as color (see alertTypeColor); LED_BRIGHTNESS caps each channel
+// because the WS2812B is blinding at full 255.
+#define LED_PIN          48
 #define USE_LED          1
-#define LED_ACTIVE_HIGH  0
 #define LED_FLASH_MS     120
+#define LED_BRIGHTNESS   64
 
 #define MIRROR_SERIAL    1
-#define MIRROR_TX_PIN    43
+#define MIRROR_TX_PIN    43     // U0TXD header pin — free since Serial is USB-CDC
 #define MIRROR_BAUD      115200
 
 #define CHANNEL_MODE_FULL_HOP   0
@@ -254,19 +260,19 @@ static void dualPrintln(const char* str) {
 #endif
 }
 
-static inline void ledSet(bool on) {
+// WS2812 write — raw per-channel values, already brightness-limited by callers.
+// rgbLedWrite() configures the RMT peripheral + pin on its first call.
+static inline void rgbShow(uint8_t r, uint8_t g, uint8_t b) {
 #if USE_LED
-#if LED_ACTIVE_HIGH
-  digitalWrite(LED_PIN, on ? HIGH : LOW);
-#else
-  digitalWrite(LED_PIN, on ? LOW  : HIGH);
-#endif
+  rgbLedWrite(LED_PIN, r, g, b);
 #endif
 }
+static inline void rgbOff() { rgbShow(0, 0, 0); }
 
-static void ledFlash(unsigned ms) {
+// One-shot colored pulse; ledTick() clears it after the timer expires.
+static void ledFlashColor(uint8_t r, uint8_t g, uint8_t b, unsigned ms) {
 #if USE_LED
-  ledSet(true);
+  rgbShow(r, g, b);
   ledOffAt = millis() + ms;
   if (ledOffAt == 0) ledOffAt = 1;  // avoid the "off" sentinel
 #endif
@@ -275,7 +281,7 @@ static void ledFlash(unsigned ms) {
 static void ledTick() {
 #if USE_LED
   if (ledOffAt && (long)(millis() - ledOffAt) >= 0) {
-    ledSet(false);
+    rgbOff();
     ledOffAt = 0;
   }
 #endif
@@ -460,6 +466,21 @@ static const char* alertTypeToMethod(AlertType t) {
     case ALERT_SSID:           return "ssid";
     case ALERT_WILDCARD_PROBE: return "wildcard_probe";
     default:                   return "unknown";
+  }
+}
+
+// Distinct WS2812 color per detection class, so the RGB LED alone tells you
+// what kind of hit fired at a glance. Values are already scaled to
+// LED_BRIGHTNESS (the WS2812B is blinding at full 255).
+static void alertTypeColor(AlertType t, uint8_t& r, uint8_t& g, uint8_t& b) {
+  const uint8_t B = LED_BRIGHTNESS;
+  switch (t) {
+    case ALERT_WILDCARD_PROBE: r = B;     g = 0;     b = 0;     break;  // red     — high-precision probe signature
+    case ALERT_OUI_ADDR2:      r = B;     g = B / 3; b = 0;     break;  // amber   — transmitter-side OUI
+    case ALERT_OUI_ADDR1:      r = 0;     g = 0;     b = B;     break;  // blue    — receiver-side sleeper catch
+    case ALERT_OUI_ADDR3:      r = 0;     g = B;     b = B;     break;  // cyan    — BSSID fallback
+    case ALERT_SSID:           r = B;     g = 0;     b = B;     break;  // magenta — SSID keyword
+    default:                   r = B;     g = B;     b = B;     break;  // white
   }
 }
 
@@ -1006,7 +1027,10 @@ static void drainAlertQueue() {
       // HB_BEEP_INTERVAL_MS after the initial chirp, not mid-window.
       fyLastHeartbeatAt = millis();
     }
-    ledFlash(LED_FLASH_MS);
+    // Flash the RGB LED in the color for this detection class.
+    uint8_t lr, lg, lb;
+    alertTypeColor(e.type, lr, lg, lb);
+    ledFlashColor(lr, lg, lb, LED_FLASH_MS);
 
 #if STOP_ON_OUI_HIT
     if (e.type != ALERT_SSID) stopSniffing("OUI hit");
@@ -1059,13 +1083,12 @@ void setup() {
 #endif
 
 #if USE_LED
-  pinMode(LED_PIN, OUTPUT);
-  ledSet(false);
+  rgbOff();   // first rgbLedWrite() configures the RMT peripheral + GPIO48
 #endif
 
   startupBeep();
 #if USE_LED
-  ledFlash(200);
+  ledFlashColor(0, LED_BRIGHTNESS, 0, 200);   // green boot pulse
 #endif
 
   precompileOuis();
