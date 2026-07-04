@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <SPIFFS.h>
+#include <Adafruit_NeoPixel.h>
 
 // ============================================================
 // CONFIG
@@ -15,10 +16,11 @@
 #define USE_BUZZER 1
 
 // Onboard WS2812 RGB LED on the "Gold Edition" is a single addressable NeoPixel
-// on GPIO2 (per the board's reference card). It's driven through the
-// Arduino-ESP32 core's built-in rgbLedWrite() (RMT-backed) — no external LED
-// library needed. Detection class is encoded as color (see alertTypeColor);
-// LED_BRIGHTNESS caps each channel because the WS2812B is blinding at full 255.
+// on GPIO2 (per the board's reference card). It's driven with the Adafruit
+// NeoPixel library (portable across all Arduino-ESP32 core versions — the
+// core's built-in rgbLedWrite() only exists on newer cores). Detection class is
+// encoded as color (see alertTypeColor); LED_BRIGHTNESS caps each channel
+// because the WS2812B is blinding at full 255.
 #define LED_PIN          2
 #define USE_LED          1
 #define LED_FLASH_MS     120
@@ -262,11 +264,14 @@ static void dualPrintln(const char* str) {
 #endif
 }
 
+// Single onboard WS2812. Constructed here; rgbLed.begin() runs once in setup().
+static Adafruit_NeoPixel rgbLed(1, LED_PIN, NEO_GRB + NEO_KHZ800);
+
 // WS2812 write — raw per-channel values, already brightness-limited by callers.
-// rgbLedWrite() configures the RMT peripheral + pin on its first call.
 static inline void rgbShow(uint8_t r, uint8_t g, uint8_t b) {
 #if USE_LED
-  rgbLedWrite(LED_PIN, r, g, b);
+  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
+  rgbLed.show();
 #endif
 }
 static inline void rgbOff() { rgbShow(0, 0, 0); }
@@ -1089,7 +1094,8 @@ void setup() {
 #endif
 
 #if USE_LED
-  rgbOff();   // first rgbLedWrite() configures the RMT peripheral + LED_PIN
+  rgbLed.begin();   // init the WS2812 driver
+  rgbOff();         // start dark
 #endif
 
   startupBeep();

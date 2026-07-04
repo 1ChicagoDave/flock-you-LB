@@ -222,7 +222,7 @@ pio run -t upload           # flash
 pio device monitor          # serial output
 ```
 
-`platformio.ini` and `partitions.csv` are at the root (4 MB flash layout: ~2.8 MB app, ~1.1 MB SPIFFS). No extra libraries needed — the WS2812 is driven by the Arduino-ESP32 core's built-in `rgbLedWrite()`, so nothing beyond the core that ships with the espressif32 platform is required.
+`platformio.ini` and `partitions.csv` are at the root (4 MB flash layout: ~2.8 MB app, ~1.1 MB SPIFFS). The one library dependency — Adafruit NeoPixel, for the onboard WS2812 — is declared in `platformio.ini` under `lib_deps`, so PlatformIO fetches it automatically on first build.
 
 ---
 
