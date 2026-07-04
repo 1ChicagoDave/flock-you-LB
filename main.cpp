@@ -10,23 +10,25 @@
 // ============================================================
 
 // External piezo buzzer. GPIO4 is a plain, non-strapping, header-exposed pin on
-// the Lonely Binary ESP32-S3 "Gold Edition" — safe to drive at boot (the old
-// XIAO GPIO3 is an ESP32-S3 strapping pin, so we moved off it).
+// the Lonely Binary ESP32 "Gold Edition" — safe to drive at boot.
 #define BUZZER_PIN 4
 #define USE_BUZZER 1
 
-// Onboard WS2812 RGB LED on the "Gold Edition" is a single addressable
-// NeoPixel on GPIO48. It's driven through the Arduino-ESP32 core's built-in
-// rgbLedWrite() (RMT-backed) — no external LED library needed. Detection class
-// is encoded as color (see alertTypeColor); LED_BRIGHTNESS caps each channel
-// because the WS2812B is blinding at full 255.
-#define LED_PIN          48
+// Onboard WS2812 RGB LED on the "Gold Edition" is a single addressable NeoPixel
+// on GPIO2 (per the board's reference card). It's driven through the
+// Arduino-ESP32 core's built-in rgbLedWrite() (RMT-backed) — no external LED
+// library needed. Detection class is encoded as color (see alertTypeColor);
+// LED_BRIGHTNESS caps each channel because the WS2812B is blinding at full 255.
+#define LED_PIN          2
 #define USE_LED          1
 #define LED_FLASH_MS     120
 #define LED_BRIGHTNESS   64
 
+// Serial1 TX-only debug mirror. The classic ESP32 has no native USB — the
+// onboard bridge drives Serial (USB) over UART0 (GPIO1/3), so we mirror on
+// GPIO17, the free UART2 TX pin. (On ESP32-S3 boards use GPIO43 instead.)
 #define MIRROR_SERIAL    1
-#define MIRROR_TX_PIN    43     // U0TXD header pin — free since Serial is USB-CDC
+#define MIRROR_TX_PIN    17
 #define MIRROR_BAUD      115200
 
 #define CHANNEL_MODE_FULL_HOP   0
@@ -236,7 +238,7 @@ typedef struct __attribute__((packed)) {
 // HELPERS
 // ============================================================
 
-// Dual-output: prints to both Serial (USB) and Serial1 (GPIO43)
+// Dual-output: prints to both Serial (USB) and Serial1 (MIRROR_TX_PIN)
 static char _dualBuf[384];
 
 static void dualPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -1068,13 +1070,17 @@ static void heartbeatTick() {
 
 void setup() {
   Serial.begin(115200);
-  // Crucial for USB-optional operation: without this, Serial.write() will
-  // block indefinitely on an ESP32-S3 USB-CDC port when no host is attached.
+  // On native-USB parts (ESP32-S3/C3) this stops Serial.write() blocking
+  // forever on the USB-CDC port when no host is attached. The classic ESP32
+  // uses a hardware UART bridge and HardwareSerial has no such method, so
+  // guard it out there.
+#if defined(ARDUINO_USB_CDC_ON_BOOT) && ARDUINO_USB_CDC_ON_BOOT
   Serial.setTxTimeoutMs(0);
+#endif
   delay(300);
 
 #if MIRROR_SERIAL
-  Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);  // TX-only on GPIO43
+  Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);  // TX-only on MIRROR_TX_PIN
 #endif
 
 #if USE_BUZZER
@@ -1083,7 +1089,7 @@ void setup() {
 #endif
 
 #if USE_LED
-  rgbOff();   // first rgbLedWrite() configures the RMT peripheral + GPIO48
+  rgbOff();   // first rgbLedWrite() configures the RMT peripheral + LED_PIN
 #endif
 
   startupBeep();
