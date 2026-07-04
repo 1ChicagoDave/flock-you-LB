@@ -26,6 +26,17 @@
 #define LED_FLASH_MS     120
 #define LED_BRIGHTNESS   64
 
+// Idle "still alive" breathing glow. A slow, subtle pulse shown whenever the
+// LED isn't mid detection-flash, so a glance confirms the unit is powered and
+// scanning. BREATHE_R/G/B is the peak color (kept dim so it never competes with
+// the bright, color-coded detection flashes); the pulse scales it 0..peak.
+#define BREATHE_ENABLE     1
+#define BREATHE_PERIOD_MS  4000    // full dim->bright->dim cycle
+#define BREATHE_UPDATE_MS  30      // LED refresh cadence
+#define BREATHE_R          0
+#define BREATHE_G          8
+#define BREATHE_B          14      // dim teal — reads as "idle / scanning"
+
 // Serial1 TX-only debug mirror. The classic ESP32 has no native USB — the
 // onboard bridge drives Serial (USB) over UART0 (GPIO1/3), so we mirror on
 // GPIO17, the free UART2 TX pin. (On ESP32-S3 boards use GPIO43 instead.)
@@ -291,6 +302,25 @@ static void ledTick() {
     rgbOff();
     ledOffAt = 0;
   }
+#endif
+}
+
+// Slow breathing pulse while idle. Skips entirely during a detection flash
+// (ledOffAt != 0), so a hit always takes over the LED cleanly.
+static unsigned long fyLastBreatheAt = 0;
+static void breatheTick() {
+#if USE_LED && BREATHE_ENABLE
+  if (ledOffAt) return;                          // a detection flash owns the LED
+  unsigned long now = millis();
+  if (now - fyLastBreatheAt < BREATHE_UPDATE_MS) return;
+  fyLastBreatheAt = now;
+
+  // Smooth 0..1 sine breathe: dark at cycle start, full at the midpoint.
+  float phase = (float)(now % BREATHE_PERIOD_MS) / (float)BREATHE_PERIOD_MS;
+  float level = (1.0f - cosf(phase * TWO_PI)) * 0.5f;
+  rgbShow((uint8_t)(BREATHE_R * level),
+          (uint8_t)(BREATHE_G * level),
+          (uint8_t)(BREATHE_B * level));
 #endif
 }
 
@@ -1152,6 +1182,7 @@ void loop() {
   autosaveTick();      // periodic SPIFFS write if dirty
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
+  breatheTick();       // subtle idle "still alive" glow between detections
   printHeartbeat();
   delay(1);
 }

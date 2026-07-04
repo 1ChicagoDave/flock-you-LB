@@ -207,6 +207,7 @@ The RGB LED encodes the detection class as color:
 | 🟦 Cyan | BSSID fallback (`addr3`) |
 | 🟣 Magenta | SSID keyword |
 | 🟢 Green | Boot / startup |
+| 🩵 Dim teal (slow breathing) | Idle — powered and scanning, no current hit |
 
 Boot sound: first 6 notes of Super Mario Bros. World 1-2 (underground).
 
