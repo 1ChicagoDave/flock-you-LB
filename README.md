@@ -258,6 +258,18 @@ Both modes work simultaneously — the SPIFFS write path doesn't care if a host 
 
 ---
 
+## Live BLE readout (iPhone / iOS)
+
+With `USE_BLE 1` (default), the firmware also mirrors every serial line over **Bluetooth LE** using the **Nordic UART Service**, so you can watch detections live on a phone with no USB cable — e.g. the Circuit Magic "BLE Controller" app, or any generic BLE terminal (nRF Connect, LightBlue, Bluefruit Connect). It advertises as `FlockYou`; subscribe to the notify characteristic and the `[flockyou] …` alert lines and JSON stream in.
+
+> **iOS note:** iPhones can't use Bluetooth *Classic* SPP (`BluetoothSerial`) — only BLE. This is a BLE (Nordic UART) implementation for exactly that reason.
+
+> **Radio coexistence:** the classic ESP32 shares one 2.4 GHz radio between WiFi and BLE. With BLE on, the promiscuous sniffer gives up some airtime and will miss a fraction of frames; the firmware calls `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` to keep sniffing prioritized. For maximum detection fidelity, set `USE_BLE 0` and use the USB/Flask path instead.
+
+Config knobs (top of `main.cpp`): `USE_BLE`, `BLE_DEVICE_NAME`, and `BLE_SVC_UUID` / `BLE_TX_UUID` / `BLE_RX_UUID` — swap the UUIDs if your app expects a different service (e.g. HM-10 style `FFE0`/`FFE1`). Driven by the lightweight **NimBLE-Arduino** library, declared in `platformio.ini`.
+
+---
+
 ## BLE companion firmware
 
 The BLE-only sibling of this firmware lives on the [`main` branch](https://github.com/colonelpanichacks/flock-you/tree/main). It detects Flock and Raven gear via BLE advertisements (OUI prefix, device name, manufacturer ID `0x09C8`, Raven service UUIDs), runs its own WiFi AP with a phone-facing dashboard at `192.168.4.1`, and emits the same Flask JSON schema. Flash both on separate boards for overlapping BLE + WiFi coverage feeding one Flask dashboard.

@@ -44,6 +44,30 @@
 #define MIRROR_TX_PIN 17
 #define MIRROR_BAUD 115200
 
+// ---- BLE serial mirror (for the Circuit Magic "BLE Controller" iOS app) ----
+// iOS can't use Bluetooth Classic SPP (the BluetoothSerial example on the
+// vendor page is Android-only), so we expose a BLE "UART" using the Nordic
+// UART Service — the de-facto standard iOS BLE terminals/controllers scan for.
+// Every line that goes to USB Serial is also notified over BLE.
+//
+// The classic ESP32 shares one 2.4 GHz radio between WiFi and BLE, so with BLE
+// enabled the promiscuous sniffer loses some frames to coexistence; we bias the
+// radio toward WiFi to minimize that. Set USE_BLE 0 for the pure-sniffing build.
+//
+// If the app can't find the device, swap these UUIDs to whatever it expects
+// (e.g. HM-10 style: service FFE0, characteristic FFE1).
+#define USE_BLE          1
+#define BLE_DEVICE_NAME  "FlockYou"
+#define BLE_SVC_UUID     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
+#define BLE_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // notify: device -> phone
+#define BLE_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // write:  phone -> device
+#define BLE_CHUNK        20     // bytes per notify — safe below the default BLE MTU
+
+#if USE_BLE
+#include <NimBLEDevice.h>
+#include "esp_coexist.h"
+#endif
+
 #define CHANNEL_MODE_FULL_HOP 0
 #define CHANNEL_MODE_CUSTOM 1
 #define CHANNEL_MODE_SINGLE 2
@@ -269,6 +293,59 @@ typedef struct __attribute__((packed))
 } wifi_ieee80211_mac_hdr_t;
 
 // ============================================================
+// BLE SERIAL MIRROR  (Nordic UART Service — notify device -> phone)
+// ============================================================
+//
+// Runs only from loop() context (via dualPrintf/dualPrintln), never from the
+// WiFi promiscuous callback, so notifying here is safe. blePrint() is a no-op
+// until a phone subscribes, so it costs nothing while disconnected.
+
+#if USE_BLE
+static NimBLECharacteristic* bleTxChar   = nullptr;
+static volatile bool         bleConnected = false;
+
+class FYServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer*)    override { bleConnected = true; }
+  void onDisconnect(NimBLEServer*) override {
+    bleConnected = false;
+    NimBLEDevice::startAdvertising();   // allow reconnect
+  }
+};
+
+static void bleBegin() {
+  NimBLEDevice::init(BLE_DEVICE_NAME);
+  NimBLEServer* server = NimBLEDevice::createServer();
+  server->setCallbacks(new FYServerCallbacks());
+
+  NimBLEService* svc = server->createService(BLE_SVC_UUID);
+  bleTxChar = svc->createCharacteristic(BLE_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
+  // RX is unused (we don't act on phone->device writes) but present so
+  // controller apps that expect a writable characteristic still bind cleanly.
+  svc->createCharacteristic(BLE_RX_UUID, NIMBLE_PROPERTY::WRITE);
+  svc->start();
+
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  adv->addServiceUUID(BLE_SVC_UUID);
+  adv->setScanResponse(true);
+  adv->start();
+}
+
+// Notify a byte span to the phone, split into MTU-safe chunks. The phone
+// reassembles the newline-delimited stream.
+static void blePrint(const char* buf, int len) {
+  if (!bleConnected || !bleTxChar || len <= 0) return;
+  for (int off = 0; off < len; off += BLE_CHUNK) {
+    int n = len - off;
+    if (n > BLE_CHUNK) n = BLE_CHUNK;
+    bleTxChar->setValue((const uint8_t*)(buf + off), (size_t)n);
+    bleTxChar->notify();
+  }
+}
+#else
+static inline void blePrint(const char*, int) {}
+#endif
+
+// ============================================================
 // HELPERS
 // ============================================================
 
@@ -288,6 +365,7 @@ static void dualPrintf(const char *fmt, ...)
 #if MIRROR_SERIAL
     Serial1.write(_dualBuf, n);
 #endif
+    blePrint(_dualBuf, n);
   }
 }
 
@@ -297,6 +375,8 @@ static void dualPrintln(const char *str)
 #if MIRROR_SERIAL
   Serial1.println(str);
 #endif
+  blePrint(str, (int)strlen(str));
+  blePrint("\n", 1);
 }
 
 // Single onboard WS2812. Constructed here; rgbLed.begin() runs once in setup().
@@ -1449,6 +1529,14 @@ void setup()
   esp_wifi_set_promiscuous_filter(&filt);
   esp_wifi_set_promiscuous_rx_cb(&wifiSniffer);
   esp_wifi_set_promiscuous(true);
+
+#if USE_BLE
+  // Stand up the BLE UART after WiFi, then bias the shared radio toward
+  // sniffing so BLE coexistence costs the fewest captured frames.
+  bleBegin();
+  esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+  dualPrintln("[flockyou] BLE serial mirror advertising as \"" BLE_DEVICE_NAME "\"");
+#endif
 
   dualPrintln("[flockyou] merged WiFi detector started");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
