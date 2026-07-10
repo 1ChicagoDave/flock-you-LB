@@ -61,7 +61,8 @@
 #define BLE_SVC_UUID     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define BLE_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // notify: device -> phone
 #define BLE_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // write:  phone -> device
-#define BLE_CHUNK        20     // bytes per notify — safe below the default BLE MTU
+#define BLE_MTU          247    // request a large ATT MTU so whole lines fit in 1-2 notifies
+#define BLE_CHUNK        20     // fallback notify size before the MTU is negotiated
 
 // Lazy connection: a long interval + slave latency lets a connected phone
 // barely touch the shared radio while idle — the ESP32 skips connection events
@@ -315,12 +316,15 @@ typedef struct __attribute__((packed))
 // until a phone subscribes, so it costs nothing while disconnected.
 
 #if USE_BLE
-static NimBLECharacteristic* bleTxChar   = nullptr;
-static volatile bool         bleConnected = false;
+static NimBLECharacteristic* bleTxChar     = nullptr;
+static NimBLEServer*         bleServer      = nullptr;
+static volatile uint16_t     bleConnHandle  = 0;
+static volatile bool         bleConnected   = false;
 
 class FYServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
-    bleConnected = true;
+    bleConnHandle = desc->conn_handle;
+    bleConnected  = true;
     // Ask the phone for a lazy connection so BLE stops hogging the radio while
     // idle; notifications still go out promptly at the next connection event.
     s->updateConnParams(desc->conn_handle,
@@ -335,10 +339,11 @@ class FYServerCallbacks : public NimBLEServerCallbacks {
 
 static void bleBegin() {
   NimBLEDevice::init(BLE_DEVICE_NAME);
-  NimBLEServer* server = NimBLEDevice::createServer();
-  server->setCallbacks(new FYServerCallbacks());
+  NimBLEDevice::setMTU(BLE_MTU);        // negotiate a large MTU so lines aren't over-fragmented
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new FYServerCallbacks());
 
-  NimBLEService* svc = server->createService(BLE_SVC_UUID);
+  NimBLEService* svc = bleServer->createService(BLE_SVC_UUID);
   bleTxChar = svc->createCharacteristic(BLE_TX_UUID, NIMBLE_PROPERTY::NOTIFY);
   // RX is unused (we don't act on phone->device writes) but present so
   // controller apps that expect a writable characteristic still bind cleanly.
@@ -353,13 +358,19 @@ static void bleBegin() {
   adv->start();
 }
 
-// Notify a byte span to the phone, split into MTU-safe chunks. The phone
-// reassembles the newline-delimited stream.
+// Notify a byte span to the phone, split into MTU-safe chunks. Using the
+// negotiated ATT MTU (minus the 3-byte ATT header) keeps whole lines to 1-2
+// notifications, so the lazy connection can drain them without dropping any.
 static void blePrint(const char* buf, int len) {
   if (!bleConnected || !bleTxChar || len <= 0) return;
-  for (int off = 0; off < len; off += BLE_CHUNK) {
+  int chunk = BLE_CHUNK;                                  // fallback until MTU is known
+  if (bleServer) {
+    uint16_t mtu = bleServer->getPeerMTU(bleConnHandle);
+    if (mtu > 3) chunk = (int)mtu - 3;
+  }
+  for (int off = 0; off < len; off += chunk) {
     int n = len - off;
-    if (n > BLE_CHUNK) n = BLE_CHUNK;
+    if (n > chunk) n = chunk;
     bleTxChar->setValue((const uint8_t*)(buf + off), (size_t)n);
     bleTxChar->notify();
   }
