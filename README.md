@@ -264,7 +264,7 @@ With `USE_BLE 1` (default), the firmware also mirrors every serial line over **B
 
 > **iOS note:** iPhones can't use Bluetooth *Classic* SPP (`BluetoothSerial`) — only BLE. This is a BLE (Nordic UART) implementation for exactly that reason.
 
-> **Radio coexistence:** the classic ESP32 shares one 2.4 GHz radio between WiFi and BLE. With BLE on, the promiscuous sniffer gives up some airtime and will miss a fraction of frames; the firmware calls `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` to keep sniffing prioritized. For maximum detection fidelity, set `USE_BLE 0` and use the USB/Flask path instead.
+> **Radio coexistence:** the classic ESP32 shares one 2.4 GHz radio between WiFi and BLE. With BLE on, the promiscuous sniffer gives up some airtime; the firmware minimizes this two ways: it biases the radio with `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)`, and it requests a **lazy BLE connection** (long interval + slave latency) so a connected phone barely touches the radio while idle — detections still notify within ~200 ms, but the sniffer keeps nearly the full radio between hits. For absolute maximum fidelity, set `USE_BLE 0` and use the USB/Flask path.
 
 Config knobs (top of `main.cpp`): `USE_BLE`, `BLE_DEVICE_NAME`, and `BLE_SVC_UUID` / `BLE_TX_UUID` / `BLE_RX_UUID` — swap the UUIDs if your app expects a different service (e.g. HM-10 style `FFE0`/`FFE1`). Driven by the lightweight **NimBLE-Arduino** library, declared in `platformio.ini`.
 

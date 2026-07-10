@@ -63,6 +63,20 @@
 #define BLE_RX_UUID      "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"  // write:  phone -> device
 #define BLE_CHUNK        20     // bytes per notify — safe below the default BLE MTU
 
+// Lazy connection: a long interval + slave latency lets a connected phone
+// barely touch the shared radio while idle — the ESP32 skips connection events
+// when it has nothing to send, and transmits at the next event (~200 ms) the
+// instant a detection fires. Keeps the link alive while handing almost all
+// airtime back to the sniffer. Values satisfy Apple's BLE parameter rules:
+//   IntervalMax*(latency+1) <= 2 s, *3 < timeout, latency <= 30, timeout <= 6 s.
+#define BLE_CONN_MIN_INTERVAL  80    // x1.25ms = 100 ms
+#define BLE_CONN_MAX_INTERVAL  160   // x1.25ms = 200 ms
+#define BLE_CONN_LATENCY       6     // connection events the peripheral may skip when idle
+#define BLE_CONN_TIMEOUT       600   // x10ms  = 6 s supervision timeout
+// Advertising interval (pre-connection radio saver — slower = less airtime).
+#define BLE_ADV_MIN_INTERVAL   800   // x0.625ms = 500 ms
+#define BLE_ADV_MAX_INTERVAL   1600  // x0.625ms = 1 s
+
 #if USE_BLE
 #include <NimBLEDevice.h>
 #include "esp_coexist.h"
@@ -305,7 +319,14 @@ static NimBLECharacteristic* bleTxChar   = nullptr;
 static volatile bool         bleConnected = false;
 
 class FYServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*)    override { bleConnected = true; }
+  void onConnect(NimBLEServer* s, ble_gap_conn_desc* desc) override {
+    bleConnected = true;
+    // Ask the phone for a lazy connection so BLE stops hogging the radio while
+    // idle; notifications still go out promptly at the next connection event.
+    s->updateConnParams(desc->conn_handle,
+                        BLE_CONN_MIN_INTERVAL, BLE_CONN_MAX_INTERVAL,
+                        BLE_CONN_LATENCY, BLE_CONN_TIMEOUT);
+  }
   void onDisconnect(NimBLEServer*) override {
     bleConnected = false;
     NimBLEDevice::startAdvertising();   // allow reconnect
@@ -327,6 +348,8 @@ static void bleBegin() {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_SVC_UUID);
   adv->setScanResponse(true);
+  adv->setMinInterval(BLE_ADV_MIN_INTERVAL);   // slow advertising = less pre-connect airtime
+  adv->setMaxInterval(BLE_ADV_MAX_INTERVAL);
   adv->start();
 }
 
