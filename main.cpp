@@ -51,12 +51,12 @@
 // Every line that goes to USB Serial is also notified over BLE.
 //
 // The classic ESP32 shares one 2.4 GHz radio between WiFi and BLE, so with BLE
-// enabled the promiscuous sniffer loses some frames to coexistence; we bias the
-// radio toward WiFi to minimize that. Set USE_BLE 0 for the pure-sniffing build.
-//
-// If the app can't find the device, swap these UUIDs to whatever it expects
-// (e.g. HM-10 style: service FFE0, characteristic FFE1).
-#define USE_BLE          1
+// enabled the promiscuous sniffer loses frames to coexistence — field-tested to
+// cause many missed detections. DISABLED by default for that reason. The code
+// stays behind this guard so it can be re-enabled, but for detection work leave
+// it 0. (If you re-enable and the app can't find the device, swap these UUIDs to
+// whatever it expects, e.g. HM-10 style: service FFE0, characteristic FFE1.)
+#define USE_BLE          0
 #define BLE_DEVICE_NAME  "FlockYou"
 #define BLE_SVC_UUID     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define BLE_TX_UUID      "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"  // notify: device -> phone
