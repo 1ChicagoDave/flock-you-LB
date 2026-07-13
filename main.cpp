@@ -37,12 +37,27 @@
 #define BREATHE_G 0
 #define BREATHE_B 14 // dim teal — reads as "idle / scanning"
 
-// Serial1 TX-only debug mirror. The classic ESP32 has no native USB — the
-// onboard bridge drives Serial (USB) over UART0 (GPIO1/3), so we mirror on
-// GPIO17, the free UART2 TX pin. (On ESP32-S3 boards use GPIO43 instead.)
-#define MIRROR_SERIAL 1
+// Serial1 (UART1) now drives the on-board GPS below, so the old TX-only debug
+// mirror is disabled — read logs over USB. (Only set MIRROR_SERIAL 1 again if
+// you free Serial1 or move GPS to another UART.)
+#define MIRROR_SERIAL 0
 #define MIRROR_TX_PIN 17
 #define MIRROR_BAUD 115200
+
+// ---- On-board GPS: Adafruit Ultimate GPS V3 (NMEA over UART) ----
+// Wiring:  GPS VIN -> 3V3 (or 5V),  GPS GND -> GND,
+//          GPS TX  -> ESP32 GPIO16 (RX),  GPS RX -> ESP32 GPIO17 (TX, optional).
+// Detections are stamped with the current fix (lat/lon + UTC) when one is
+// available; with no fix they're still recorded, just without geodata.
+#define USE_GPS      1
+#define GPS_RX_PIN   16   // ESP32 receives NMEA here  (<- GPS TX)
+#define GPS_TX_PIN   17   // ESP32 transmits here      (-> GPS RX, optional)
+#define GPS_BAUD     9600 // Adafruit Ultimate GPS default
+#define GPS_STALE_MS 5000 // a fix older than this counts as lost
+
+#if USE_GPS
+#include <TinyGPS++.h>
+#endif
 
 // ---- BLE serial mirror (for the Circuit Magic "BLE Controller" iOS app) ----
 // iOS can't use Bluetooth Classic SPP (the BluetoothSerial example on the
@@ -297,6 +312,15 @@ static volatile unsigned long ledOffAt = 0;
 // HB_DEVICE_ACTIVE_MS the heartbeat stops until the next new detection.
 static unsigned long fyLastTargetSeen = 0;
 static unsigned long fyLastHeartbeatAt = 0;
+
+// GPS fix state — refreshed by the GPS reader in loop(). Stays "no fix" until
+// the module gets a lock; detections are geotagged from these when hasFix.
+static double gpsLat = 0.0;
+static double gpsLon = 0.0;
+static uint32_t gpsUtc = 0; // unix epoch, UTC (0 if unknown)
+static double gpsHdop = 0.0;
+static uint8_t gpsSats = 0;
+static bool gpsHasFix = false;
 
 // ============================================================
 // 802.11 HEADER
@@ -692,8 +716,9 @@ static void printHeartbeat()
 {
   if (millis() - lastHeartbeat >= HEARTBEAT_MS)
   {
-    dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d)\n",
-               currentChannel, channelModeName(), fyDetCount);
+    dualPrintf("[flockyou] scanning (ch=%u mode=%s det=%d gps=%s sats=%u)\n",
+               currentChannel, channelModeName(), fyDetCount,
+               gpsHasFix ? "fix" : "none", (unsigned)gpsSats);
     lastHeartbeat = millis();
   }
 }
@@ -761,15 +786,6 @@ static void alertTypeColor(AlertType t, uint8_t &r, uint8_t &g, uint8_t &b)
     break; // white
   }
 }
-
-// ------------------------------------------------------------
-// GPS fix state — updated by the GPS reader in loop() (Stage 3). Until a real
-// fix arrives this stays "no fix", and detections are stored without geodata.
-// ------------------------------------------------------------
-static double gpsLat = 0.0;
-static double gpsLon = 0.0;
-static uint32_t gpsUtc = 0; // unix epoch, UTC
-static bool gpsHasFix = false;
 
 // Stamp a detection record with the current GPS fix at first sighting.
 static void fyStampGps(FYDetection &d)
@@ -1092,6 +1108,18 @@ static void emitDetectionJSON(const char *mac, const char *method,
          &mbytes[0], &mbytes[1], &mbytes[2], &mbytes[3], &mbytes[4], &mbytes[5]);
   ouiFromMac(mbytes, oui, sizeof(oui));
 
+  // GPS block (only when we have a current fix). accuracy is a rough metres
+  // estimate from HDOP. Slots in before "ssid" and ends with its own comma.
+  char gpsField[112];
+  if (gpsHasFix)
+    snprintf(gpsField, sizeof(gpsField),
+             "\"gps\":{\"latitude\":%.6f,\"longitude\":%.6f,\"accuracy\":%.1f},"
+             "\"utc\":%lu,",
+             gpsLat, gpsLon, (gpsHdop > 0.0) ? gpsHdop * 2.5 : 0.0,
+             (unsigned long)gpsUtc);
+  else
+    gpsField[0] = '\0';
+
   dualPrintf(
       "{\"event\":\"detection\","
       "\"detection_method\":\"wifi_%s\","
@@ -1102,9 +1130,10 @@ static void emitDetectionJSON(const char *mac, const char *method,
       "\"rssi\":%d,"
       "\"channel\":%u,"
       "\"frequency\":%u,"
+      "%s"
       "\"ssid\":\"%s\"}\n",
       method, mac, oui, rssi,
-      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc);
+      (unsigned)ch, (unsigned)channelFreqMhz(ch), gpsField, ssidEsc);
 }
 
 // ============================================================
@@ -1344,21 +1373,26 @@ static void drainAlertQueue()
     if (shouldSuppressDuplicate(macStr))
       continue;
 
-    // Human-readable line (for serial terminal / mirror).
+    // Human-readable line (for serial terminal).
     char oui[9];
     ouiFromMac(e.mac, oui, sizeof(oui));
+    char gtag[52];
+    if (gpsHasFix)
+      snprintf(gtag, sizeof(gtag), " gps=%.6f,%.6f", gpsLat, gpsLon);
+    else
+      gtag[0] = '\0';
     if (e.type == ALERT_SSID)
     {
-      dualPrintf("[flockyou] DETECT-SSID type=%s mac=%s ssid=\"%s\" rssi=%d ch=%u count=%d\n",
+      dualPrintf("[flockyou] DETECT-SSID type=%s mac=%s ssid=\"%s\" rssi=%d ch=%u count=%d%s\n",
                  e.frameKind, macStr, e.ssid, e.rssi, e.channel,
-                 (idx >= 0) ? (int)fyDet[idx].count : 0);
+                 (idx >= 0) ? (int)fyDet[idx].count : 0, gtag);
     }
     else
     {
-      dualPrintf("[flockyou] DETECT-OUI mac=%s oui=%s rssi=%d ch=%u addr=%s count=%d\n",
+      dualPrintf("[flockyou] DETECT-OUI mac=%s oui=%s rssi=%d ch=%u addr=%s count=%d%s\n",
                  macStr, oui, e.rssi, e.channel,
                  e.frameKind[0] ? e.frameKind : "addr2",
-                 (idx >= 0) ? (int)fyDet[idx].count : 0);
+                 (idx >= 0) ? (int)fyDet[idx].count : 0, gtag);
     }
 
     // Flask-compatible JSON line (parsed by api/flockyou.py over USB CDC).
@@ -1421,6 +1455,58 @@ static void heartbeatTick()
 }
 
 // ============================================================
+// GPS READER  (NMEA over Serial1, parsed by TinyGPS++)
+// ============================================================
+#if USE_GPS
+static TinyGPSPlus gps;
+
+// Days since the Unix epoch for a civil (y,m,d) date — Howard Hinnant's algo.
+static long daysFromCivil(long y, unsigned m, unsigned d)
+{
+  y -= m <= 2;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  unsigned yoe = (unsigned)(y - era * 400);
+  unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (long)doe - 719468;
+}
+
+static void gpsBegin()
+{
+  Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+}
+
+// Feed NMEA bytes to the parser and refresh the shared fix state.
+static void gpsTick()
+{
+  while (Serial1.available())
+    gps.encode((char)Serial1.read());
+
+  if (gps.location.isValid() && gps.location.age() < GPS_STALE_MS)
+  {
+    gpsLat = gps.location.lat();
+    gpsLon = gps.location.lng();
+    gpsHdop = gps.hdop.isValid() ? (gps.hdop.value() / 100.0) : 0.0; // value() = HDOP×100
+    gpsSats = gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0;
+    if (gps.date.isValid() && gps.time.isValid() && gps.date.age() < GPS_STALE_MS)
+    {
+      long days = daysFromCivil(gps.date.year(), gps.date.month(), gps.date.day());
+      gpsUtc = (uint32_t)days * 86400UL + (uint32_t)gps.time.hour() * 3600UL +
+               (uint32_t)gps.time.minute() * 60UL + (uint32_t)gps.time.second();
+    }
+    gpsHasFix = true;
+  }
+  else
+  {
+    gpsHasFix = false; // no current fix — detections recorded without geodata
+  }
+}
+#else
+static inline void gpsBegin() {}
+static inline void gpsTick() {}
+#endif
+
+// ============================================================
 // SETUP / LOOP
 // ============================================================
 
@@ -1438,6 +1524,10 @@ void setup()
 
 #if MIRROR_SERIAL
   Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN); // TX-only on MIRROR_TX_PIN
+#endif
+
+#if USE_GPS
+  gpsBegin(); // Serial1 -> Adafruit Ultimate GPS (NMEA @ GPS_BAUD)
 #endif
 
 #if USE_BUZZER
@@ -1511,6 +1601,7 @@ void setup()
 
 void loop()
 {
+  gpsTick();         // feed NMEA + refresh fix before detections are stamped
   updateChannelMode();
   drainAlertQueue(); // Serial.printf happens here, not in callback
   autosaveTick();    // periodic SPIFFS write if dirty

@@ -122,31 +122,28 @@ Full dataset and methodology: [`datasets/NitekryDPaul_wifi_ouis.md`](datasets/Ni
 
 ---
 
-## SPIFFS wire format
+## SPIFFS persistence (reloads on boot)
 
-On-flash layout, atomic and crash-safe:
+The detection table is saved to SPIFFS as a compact **binary snapshot** and — crucially — **reloaded into the live table on boot**, so the count accumulates and survives power loss instead of resetting to 0. On-disk layout:
 
 ```
-Line 1: {"v":1,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}
-Line 2: [{"mac":"...","method":"...","rssi":...,...},...]
+Header:  magic 'FLK2' | version | recSize=sizeof(FYDetection) | count | CRC32(records)
+Records: count × FYDetection structs (raw)
 ```
 
-Save procedure:
+Save procedure (autosaves every 60 s when dirty):
 
-1. Compute CRC32 + byte count over the serialised payload
-2. Write envelope header + payload to `/session.tmp`
-3. Re-read and re-validate `/session.tmp` (CRC check)
-4. Remove `/session.json`
-5. Atomic rename `/session.tmp` → `/session.json` (copy+delete fallback)
+1. CRC32 the records region
+2. Write header + records to `/fy_sess.tmp`
+3. Atomic rename `/fy_sess.tmp` → `/fy_sess.bin` (copy+delete fallback)
 
-Boot recovery:
+Boot:
 
-1. If `/session.json` validates, promote it to `/prev_session.json`
-2. Otherwise try `/session.tmp` (interrupted save)
-3. Delete both working files, start with an empty live table
-4. `/prev_session.json` stays around for inspection
+1. Read `/fy_sess.bin` (fallback `/fy_sess.tmp` from an interrupted save)
+2. Validate magic / version / `recSize` / CRC32 — a mismatch (e.g. a firmware struct change) is ignored and the table starts fresh
+3. Load the records into the live table; scanning continues from the saved count
 
-CRC32 uses the standard `0xEDB88320` polynomial so the same file can be verified on a host with any off-the-shelf CRC tool.
+`recSize` in the header makes the format self-guarding across firmware versions, and CRC32 uses the standard `0xEDB88320` polynomial.
 
 ---
 
@@ -155,8 +152,10 @@ CRC32 uses the standard `0xEDB88320` polynomial so the same file can be verified
 The firmware emits one JSON line per detection in the same schema the BLE detector uses, so `api/flockyou.py` picks it up with zero changes:
 
 ```json
-{"event":"detection","detection_method":"wifi_oui_addr2","protocol":"wifi_2_4ghz","mac_address":"aa:bb:cc:dd:ee:ff","oui":"aa:bb:cc","device_name":"","rssi":-62,"channel":6,"frequency":2437,"ssid":""}
+{"event":"detection","detection_method":"wifi_oui_addr2","protocol":"wifi_2_4ghz","mac_address":"aa:bb:cc:dd:ee:ff","oui":"aa:bb:cc","device_name":"","rssi":-62,"channel":6,"frequency":2437,"gps":{"latitude":37.421998,"longitude":-122.084000,"accuracy":6.2},"utc":1752345600,"ssid":""}
 ```
+
+The `gps` object and `utc` (unix epoch, UTC) are included only when the on-board GPS has a current fix; without one, both are omitted and the rest of the line is unchanged.
 
 `detection_method` values:
 
@@ -168,12 +167,9 @@ The firmware emits one JSON line per detection in the same schema the BLE detect
 
 ### GPS wardriving
 
-GPS is handled Flask-side, since the ESP32 radio is dedicated to sniffing and there's no on-device AP. Two options:
+GPS is now handled **on-device** by the Adafruit Ultimate GPS V3 (see Hardware). Each detection is geotagged with lat/lon and a UTC timestamp at the moment of first sighting, embedded directly in the JSON line and saved into the persistent detection record — no Flask-side GPS puck or browser geolocation required. Flask ingests the `gps`/`utc` fields directly for map export (JSON / CSV / KML for Google Earth).
 
-- **USB NMEA puck** plugged into the host running Flask — Flask reads NMEA and timestamps a GPS timeline
-- **Flask dashboard open in a phone browser** — browser Geolocation API posts updates to Flask
-
-Flask does a temporal match between detection timestamp and GPS timeline, then exports JSON / CSV / KML for Google Earth.
+(The older Flask-side options — a USB NMEA puck or the dashboard's browser Geolocation — still work if you build without GPS, `USE_GPS 0`.)
 
 ### Running Flask
 
@@ -195,7 +191,10 @@ Open `http://localhost:5000`, pick your serial port from the UI, detections star
 |-----|----------|
 | GPIO 4 | External piezo buzzer |
 | GPIO 2 | Onboard WS2812 RGB LED (addressable NeoPixel) |
-| GPIO 17 | Serial1 TX mirror (115200 baud) — UART2 TX |
+| GPIO 16 | GPS NMEA in — Serial1 RX (← GPS TX) |
+| GPIO 17 | GPS out — Serial1 TX (→ GPS RX, optional) |
+
+**GPS (Adafruit Ultimate GPS V3):** VIN → 3V3 (or 5V), GND → GND, GPS **TX → GPIO 16**, GPS **RX → GPIO 17** (optional). Default 9600-baud NMEA, parsed on-device with TinyGPS++. Every detection is stamped with the current fix (lat/lon + UTC epoch); with no fix, detections are still recorded, just without geodata. The Serial1 debug mirror was retired to free the UART for GPS — read logs over USB.
 
 The RGB LED encodes the detection class as color:
 
@@ -250,7 +249,7 @@ pio device monitor          # serial output
 
 ## Standalone vs connected
 
-**Without USB:** device boots, plays the SMB 1-2 intro, starts scanning, stores every unique detection to SPIFFS, flashes the onboard LED on each hit. Plug in later — the prior session is sitting in `/prev_session.json`.
+**Without USB:** device boots, reloads its saved detection table from SPIFFS (count picks up where it left off), plays the SMB 1-2 intro, starts scanning, stores every unique detection with GPS geotag, flashes the onboard LED on each hit.
 
 **With USB + Flask running:** same thing, plus every detection streams live to the dashboard as a JSON line. Flask adds GPS (if configured) and deduplicates across MAC, building the wardriving map as you move.
 
@@ -260,13 +259,9 @@ Both modes work simultaneously — the SPIFFS write path doesn't care if a host 
 
 ## Live BLE readout (iPhone / iOS)
 
-With `USE_BLE 1` (default), the firmware also mirrors every serial line over **Bluetooth LE** using the **Nordic UART Service**, so you can watch detections live on a phone with no USB cable — e.g. the Circuit Magic "BLE Controller" app, or any generic BLE terminal (nRF Connect, LightBlue, Bluefruit Connect). It advertises as `FlockYou`; subscribe to the notify characteristic and the `[flockyou] …` alert lines and JSON stream in.
+A BLE serial mirror (Nordic UART Service, advertises as `FlockYou`) is implemented but **disabled by default (`USE_BLE 0`)**. On the single-radio classic ESP32, BLE coexistence steals airtime from the promiscuous sniffer and — confirmed in field testing — causes many missed detections, which defeats the purpose of the device. The code stays behind the `USE_BLE` guard (with a lazy-connection + WiFi-priority coexistence design) so it can be re-enabled for casual monitoring, but for detection work leave it off and read over USB/Flask.
 
-> **iOS note:** iPhones can't use Bluetooth *Classic* SPP (`BluetoothSerial`) — only BLE. This is a BLE (Nordic UART) implementation for exactly that reason.
-
-> **Radio coexistence:** the classic ESP32 shares one 2.4 GHz radio between WiFi and BLE. With BLE on, the promiscuous sniffer gives up some airtime; the firmware minimizes this two ways: it biases the radio with `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)`, and it requests a **lazy BLE connection** (long interval + slave latency) so a connected phone barely touches the radio while idle — detections still notify within ~200 ms, but the sniffer keeps nearly the full radio between hits. For absolute maximum fidelity, set `USE_BLE 0` and use the USB/Flask path.
-
-Config knobs (top of `main.cpp`): `USE_BLE`, `BLE_DEVICE_NAME`, and `BLE_SVC_UUID` / `BLE_TX_UUID` / `BLE_RX_UUID` — swap the UUIDs if your app expects a different service (e.g. HM-10 style `FFE0`/`FFE1`). Driven by the lightweight **NimBLE-Arduino** library, declared in `platformio.ini`.
+> **iOS note:** if you do re-enable it, iPhones can't use Bluetooth *Classic* SPP (`BluetoothSerial`) — only BLE. This is a BLE (Nordic UART) implementation for exactly that reason. Enabling `USE_BLE` also re-adds the NimBLE-Arduino dependency in `platformio.ini`.
 
 ---
 
