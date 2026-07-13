@@ -130,11 +130,12 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 #define PROCESS_MGMT_FRAMES 1
 #define PROCESS_DATA_FRAMES 1
 
-// Persistence
+// Persistence — binary snapshot, reloaded on boot so counts survive power loss.
 #define MAX_DETECTIONS 200
-#define FY_SESSION_FILE "/session.json"
-#define FY_SESSION_TMP "/session.tmp"
-#define FY_PREV_FILE "/prev_session.json"
+#define FY_SESSION_FILE "/fy_sess.bin"
+#define FY_SESSION_TMP "/fy_sess.tmp"
+#define FY_FILE_MAGIC 0x464C4B32u // 'FLK2'
+#define FY_FILE_VERSION 2
 #define AUTOSAVE_INTERVAL_MS 60000
 
 // ============================================================
@@ -251,7 +252,11 @@ typedef struct
   uint32_t firstSeen; // millis() at first hit
   uint32_t lastSeen;  // millis() at latest hit
   uint16_t count;
-  char ssid[33]; // "" unless an SSID hit populated it
+  char ssid[33];  // "" unless an SSID hit populated it
+  float lat;      // GPS latitude at first hit (0 if no fix)
+  float lon;      // GPS longitude at first hit (0 if no fix)
+  uint32_t utc;   // GPS UTC as unix epoch at first hit (0 if no fix)
+  uint8_t hasFix; // 1 if lat/lon/utc are valid
 } FYDetection;
 
 static FYDetection fyDet[MAX_DETECTIONS];
@@ -757,6 +762,34 @@ static void alertTypeColor(AlertType t, uint8_t &r, uint8_t &g, uint8_t &b)
   }
 }
 
+// ------------------------------------------------------------
+// GPS fix state — updated by the GPS reader in loop() (Stage 3). Until a real
+// fix arrives this stays "no fix", and detections are stored without geodata.
+// ------------------------------------------------------------
+static double gpsLat = 0.0;
+static double gpsLon = 0.0;
+static uint32_t gpsUtc = 0; // unix epoch, UTC
+static bool gpsHasFix = false;
+
+// Stamp a detection record with the current GPS fix at first sighting.
+static void fyStampGps(FYDetection &d)
+{
+  if (gpsHasFix)
+  {
+    d.lat = (float)gpsLat;
+    d.lon = (float)gpsLon;
+    d.utc = gpsUtc;
+    d.hasFix = 1;
+  }
+  else
+  {
+    d.lat = 0.0f;
+    d.lon = 0.0f;
+    d.utc = 0;
+    d.hasFix = 0;
+  }
+}
+
 // Returns index of entry (new or updated), or -1 if table is full.
 // Returns index, and sets *outChirpWorthy = true when the caller should fire
 // the ascending new-discovery chirp. Chirp-worthy means either (a) MAC is
@@ -805,6 +838,7 @@ static int fyAddDetection(const char *mac, const char *method,
     strlcpy(d.ssid, ssid, sizeof(d.ssid));
   else
     d.ssid[0] = '\0';
+  fyStampGps(d); // geotag + timestamp the first sighting (no-op without a fix)
   fyDetCount++;
   fyDirty = true;
   if (outChirpWorthy)
@@ -868,132 +902,28 @@ static uint32_t fyCRC32Update(uint32_t crc, const uint8_t *data, size_t len)
 }
 
 // ============================================================
-// SPIFFS SESSION PERSISTENCE  — bulletproof envelope format
+// SPIFFS SESSION PERSISTENCE  — binary snapshot, reloaded on boot
 // ============================================================
 //
-// Wire format on disk:
-//   Line 1: {"v":1,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}\n
-//   Line 2+: [{"mac":...},...]     (exactly B bytes, CRC32 == X)
+// The on-disk file is only for on-device persistence (Flask reads the live
+// serial stream, not this file), so we dump the detection table as a compact
+// binary snapshot: a small header + a raw array of FYDetection records. Simple
+// and reliable to round-trip, so the table survives power loss and is reloaded
+// on boot — the count keeps accumulating instead of resetting to 0.
 //
-// Atomic write procedure:
-//   1. Compute payload size + CRC (pass 1)
-//   2. Write envelope + payload to /session.tmp (pass 2)
-//   3. Re-validate /session.tmp from disk
-//   4. Remove /session.json, rename tmp → main (with copy+delete fallback)
-//
-// Boot-time recovery:
-//   - Try /session.json. If missing or CRC-invalid, try /session.tmp.
-//   - Copy whichever validates to /prev_session.json, then delete both.
+// Atomic write: header+records -> /fy_sess.tmp, then rename to /fy_sess.bin.
+// Boot: read /fy_sess.bin (fallback /fy_sess.tmp), validate magic/version/
+// recSize/CRC, load records into the live table. recSize guards against struct
+// layout changes across firmware versions — a mismatched file is ignored.
 
-static size_t fySerializeDet(const FYDetection &d, char *dst, size_t cap)
+typedef struct
 {
-  char ssidEsc[sizeof(d.ssid) * 6 + 1];
-  jsonEscape(ssidEsc, sizeof(ssidEsc), d.ssid);
-  int n = snprintf(dst, cap,
-                   "{\"mac\":\"%s\",\"method\":\"%s\",\"rssi\":%d,\"channel\":%u,"
-                   "\"first\":%lu,\"last\":%lu,\"count\":%u,\"ssid\":\"%s\"}",
-                   d.mac, d.method, d.rssi, (unsigned)d.channel,
-                   (unsigned long)d.firstSeen, (unsigned long)d.lastSeen, (unsigned)d.count,
-                   ssidEsc);
-  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
-}
-
-static uint32_t fyComputePayloadCRC(size_t &outBytes)
-{
-  char line[384];
-  uint32_t crc = 0;
-  outBytes = 0;
-  crc = fyCRC32Update(crc, (const uint8_t *)"[", 1);
-  outBytes += 1;
-  for (int i = 0; i < fyDetCount; i++)
-  {
-    if (i > 0)
-    {
-      crc = fyCRC32Update(crc, (const uint8_t *)",", 1);
-      outBytes += 1;
-    }
-    size_t n = fySerializeDet(fyDet[i], line, sizeof(line));
-    if (n == 0)
-      continue;
-    crc = fyCRC32Update(crc, (const uint8_t *)line, n);
-    outBytes += n;
-  }
-  crc = fyCRC32Update(crc, (const uint8_t *)"]", 1);
-  outBytes += 1;
-  return crc;
-}
-
-// Minimal envelope parser: pulls bytes + crc fields by substring search.
-// Robust to field reordering; rejects anything without both required keys.
-static bool fyParseEnvelope(const char *hdr, size_t &outBytes, uint32_t &outCrc)
-{
-  const char *b = strstr(hdr, "\"bytes\":");
-  const char *c = strstr(hdr, "\"crc\":\"0x");
-  if (!b || !c)
-    return false;
-  b += 8;
-  long long bv = 0;
-  if (sscanf(b, "%lld", &bv) != 1 || bv < 0)
-    return false;
-  c += 9;
-  unsigned cv = 0;
-  if (sscanf(c, "%x", &cv) != 1)
-    return false;
-  outBytes = (size_t)bv;
-  outCrc = (uint32_t)cv;
-  return true;
-}
-
-static bool fyValidateSessionFile(const char *path)
-{
-  if (!SPIFFS.exists(path))
-    return false;
-  File f = SPIFFS.open(path, "r");
-  if (!f)
-    return false;
-
-  String hdr = f.readStringUntil('\n');
-  if (hdr.length() < 10 || hdr[0] != '{')
-  {
-    f.close();
-    return false;
-  }
-
-  size_t expectedBytes = 0;
-  uint32_t expectedCRC = 0;
-  if (!fyParseEnvelope(hdr.c_str(), expectedBytes, expectedCRC))
-  {
-    f.close();
-    return false;
-  }
-
-  size_t bodyOffset = hdr.length() + 1;
-  size_t fileSize = f.size();
-  if (fileSize < bodyOffset + expectedBytes)
-  {
-    f.close();
-    return false;
-  }
-  if ((fileSize - bodyOffset) != expectedBytes)
-  {
-    f.close();
-    return false;
-  }
-
-  uint8_t buf[256];
-  uint32_t crc = 0;
-  size_t remaining = expectedBytes;
-  while (remaining > 0)
-  {
-    int n = f.read(buf, remaining < sizeof(buf) ? remaining : sizeof(buf));
-    if (n <= 0)
-      break;
-    crc = fyCRC32Update(crc, buf, (size_t)n);
-    remaining -= (size_t)n;
-  }
-  f.close();
-  return (remaining == 0 && crc == expectedCRC);
-}
+  uint32_t magic;   // FY_FILE_MAGIC
+  uint16_t version; // FY_FILE_VERSION
+  uint16_t recSize; // sizeof(FYDetection) — rejects files from a different layout
+  uint32_t count;   // number of FYDetection records that follow
+  uint32_t crc;     // CRC32 over the records region
+} FYFileHdr;
 
 static bool fySpiffsCopy(const char *src, const char *dst)
 {
@@ -1039,9 +969,9 @@ static void fySaveSession()
   if (!fyDirty && fyDetCount == fyLastSaveCount)
     return;
 
-  size_t payloadBytes = 0;
-  uint32_t crc = fyComputePayloadCRC(payloadBytes);
   int savedCount = fyDetCount;
+  size_t bytes = (size_t)savedCount * sizeof(FYDetection);
+  uint32_t crc = fyCRC32Update(0, (const uint8_t *)fyDet, bytes);
 
   File f = SPIFFS.open(FY_SESSION_TMP, "w");
   if (!f)
@@ -1049,40 +979,15 @@ static void fySaveSession()
     dualPrintf("[flockyou] save failed: cannot open %s\n", FY_SESSION_TMP);
     return;
   }
-  f.printf("{\"v\":1,\"count\":%d,\"bytes\":%u,\"crc\":\"0x%08lX\"}\n",
-           savedCount, (unsigned)payloadBytes, (unsigned long)crc);
-
-  char line[384];
-  size_t wrote = 0;
-  f.write((uint8_t *)"[", 1);
-  wrote++;
-  for (int i = 0; i < fyDetCount; i++)
-  {
-    if (i > 0)
-    {
-      f.write((uint8_t *)",", 1);
-      wrote++;
-    }
-    size_t n = fySerializeDet(fyDet[i], line, sizeof(line));
-    if (n == 0)
-      continue;
-    f.write((uint8_t *)line, n);
-    wrote += n;
-  }
-  f.write((uint8_t *)"]", 1);
-  wrote++;
+  FYFileHdr hdr = {FY_FILE_MAGIC, (uint16_t)FY_FILE_VERSION,
+                   (uint16_t)sizeof(FYDetection), (uint32_t)savedCount, crc};
+  bool ok = f.write((const uint8_t *)&hdr, sizeof(hdr)) == sizeof(hdr);
+  if (ok && bytes > 0)
+    ok = f.write((const uint8_t *)fyDet, bytes) == bytes;
   f.close();
-
-  if (wrote != payloadBytes)
+  if (!ok)
   {
-    dualPrintf("[flockyou] save WARNING: wrote %u expected %u — aborting\n",
-               (unsigned)wrote, (unsigned)payloadBytes);
-    return;
-  }
-
-  if (!fyValidateSessionFile(FY_SESSION_TMP))
-  {
-    dualPrintf("[flockyou] save verify FAILED — old session preserved\n");
+    dualPrintf("[flockyou] save WRITE failed — old session preserved\n");
     return;
   }
 
@@ -1097,48 +1002,71 @@ static void fySaveSession()
   fyLastSaveCount = savedCount;
   fyDirty = false;
   dualPrintf("[flockyou] session saved: %d det, %u bytes, crc=0x%08lX\n",
-             savedCount, (unsigned)payloadBytes, (unsigned long)crc);
+             savedCount, (unsigned)(sizeof(hdr) + bytes), (unsigned long)crc);
 }
 
-// Promote any valid session file from last boot into /prev_session.json, then
-// start this boot with a fresh empty table. Preserves history across power cycles.
-static void fyPromotePrevSession()
+// Read a binary snapshot into the live table. Returns records loaded, or 0 if
+// the file is missing / from a different layout / corrupt.
+static int fyLoadSessionFrom(const char *path)
+{
+  if (!SPIFFS.exists(path))
+    return 0;
+  File f = SPIFFS.open(path, "r");
+  if (!f)
+    return 0;
+
+  FYFileHdr hdr;
+  if (f.read((uint8_t *)&hdr, sizeof(hdr)) != (int)sizeof(hdr))
+  {
+    f.close();
+    return 0;
+  }
+  if (hdr.magic != FY_FILE_MAGIC || hdr.version != FY_FILE_VERSION ||
+      hdr.recSize != (uint16_t)sizeof(FYDetection) || hdr.count > (uint32_t)MAX_DETECTIONS)
+  {
+    f.close();
+    return 0;
+  }
+  size_t bytes = (size_t)hdr.count * sizeof(FYDetection);
+  if ((size_t)f.size() < sizeof(hdr) + bytes)
+  {
+    f.close();
+    return 0;
+  }
+  int loaded = 0;
+  if (hdr.count > 0)
+  {
+    if (f.read((uint8_t *)fyDet, bytes) != (int)bytes)
+    {
+      f.close();
+      return 0;
+    }
+    if (fyCRC32Update(0, (const uint8_t *)fyDet, bytes) != hdr.crc)
+    {
+      f.close();
+      return 0; // corrupt — ignore
+    }
+    loaded = (int)hdr.count;
+  }
+  f.close();
+  return loaded;
+}
+
+// Load the saved table on boot so detections persist across power loss.
+static void fyLoadSession()
 {
   if (!fySpiffsReady)
     return;
-
-  const char *source = nullptr;
-  if (fyValidateSessionFile(FY_SESSION_FILE))
-    source = FY_SESSION_FILE;
-  else if (fyValidateSessionFile(FY_SESSION_TMP))
-    source = FY_SESSION_TMP;
-
-  if (!source)
-  {
-    if (SPIFFS.exists(FY_SESSION_FILE))
-      SPIFFS.remove(FY_SESSION_FILE);
-    if (SPIFFS.exists(FY_SESSION_TMP))
-      SPIFFS.remove(FY_SESSION_TMP);
-    dualPrintln("[flockyou] no valid prior session to promote");
-    return;
-  }
-
-  if (!fySpiffsCopy(source, FY_PREV_FILE))
-  {
-    dualPrintf("[flockyou] failed to promote %s → %s\n", source, FY_PREV_FILE);
-    return;
-  }
-  if (SPIFFS.exists(FY_SESSION_FILE))
-    SPIFFS.remove(FY_SESSION_FILE);
-  if (SPIFFS.exists(FY_SESSION_TMP))
-    SPIFFS.remove(FY_SESSION_TMP);
-
-  File v = SPIFFS.open(FY_PREV_FILE, "r");
-  size_t sz = v ? v.size() : 0;
-  if (v)
-    v.close();
-  dualPrintf("[flockyou] prior session promoted from %s (%u bytes)\n",
-             source, (unsigned)sz);
+  int n = fyLoadSessionFrom(FY_SESSION_FILE);
+  if (n == 0)
+    n = fyLoadSessionFrom(FY_SESSION_TMP); // interrupted-save fallback
+  fyDetCount = n;
+  fyLastSaveCount = n;
+  fyDirty = false;
+  if (n > 0)
+    dualPrintf("[flockyou] restored %d detections from flash\n", n);
+  else
+    dualPrintln("[flockyou] no prior session — starting fresh");
 }
 
 // ============================================================
@@ -1535,7 +1463,7 @@ void setup()
   {
     fySpiffsReady = true;
     dualPrintln("[flockyou] SPIFFS ready");
-    fyPromotePrevSession();
+    fyLoadSession();
   }
   else
   {
