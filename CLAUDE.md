@@ -54,8 +54,11 @@ back to normal with BLE off; (2) `restored N detections` on reboot; (3) GPS
 `gps=fix` in the status line + geotags after an outdoor lock.
 
 ## Open / possible next steps
-- Piezo **~4 kHz resonance retune** for loudness (chirp/heartbeat are below the
-  disc's loud band) — offered, not done.
+- **Piezo loudness** — full implementation plan in
+  [`docs/PIEZO_LOUDNESS_PLAN.md`](docs/PIEZO_LOUDNESS_PLAN.md): BTL/anti-phase
+  drive (2nd output on **GPIO18**, ~6.6 V p-p, +6 dB) via two phase-offset LEDC
+  channels, plus a `PIEZO_RESONANCE_HZ` (~4 kHz) retune. Ready to execute; needs
+  a second wire to the piezo and a local compile/test.
 - Optional **per-hit GPS track log** (every re-sighting as its own point) vs the
   current one-geotag-per-unique-device model.
 - `docs/BLE_DUP_PENDING.md` was removed (issue resolved).
