@@ -145,6 +145,13 @@ Boot:
 
 `recSize` in the header makes the format self-guarding across firmware versions, and CRC32 uses the standard `0xEDB88320` polynomial.
 
+### Exporting the log to your computer
+
+Two ways to get data off the device:
+
+- **Live stream (no setup):** every detection prints as a JSON line over USB as it happens. Capture it with `monitor_filters = log2file` in `platformio.ini`, or `pio device monitor | tee flock-log.txt`. This logs only what's seen while connected.
+- **Stored table on demand:** open the serial monitor and press a key — **`d`** dumps the full accumulated table as **CSV** (mac, method, rssi, channel, count, first/last-seen, lat, lon, utc, hasFix, ssid), **`j`** dumps it as **JSON**. This is how you pull the persisted `/fy_sess.bin` log (it's raw binary on flash, not directly readable). Save the monitor output, and the CSV opens straight into a spreadsheet or converts to KML for Google Earth.
+
 ---
 
 ## Flask dashboard integration

@@ -37,6 +37,9 @@ GPS = Adafruit Ultimate GPS V3, 9600 NMEA, parsed by TinyGPS++. VIN→3V3, GND�
   **reloaded into the live table on boot** so counts survive power loss. Format
   changed from the old `/session.json`, so the first boot after flashing starts
   fresh (expected). `recSize` guard rejects mismatched-layout files.
+- **Log export:** in the serial monitor, `d` dumps the stored table as CSV, `j`
+  as JSON (`serialCommandTick()` in loop). The live per-detection JSON stream
+  also works for capture (`monitor_filters = log2file`).
 - **GPS** stamps each detection's first sighting with lat/lon + UTC epoch:
   embedded in the JSON (`gps{}`+`utc`, Flask-compatible), in the human DETECT
   lines, and in the persisted record. No fix → still recorded, no geodata.

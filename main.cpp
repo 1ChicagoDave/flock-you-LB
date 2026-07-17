@@ -1455,6 +1455,64 @@ static void heartbeatTick()
 }
 
 // ============================================================
+// LOG EXPORT  — dump the stored detection table over USB serial
+// ============================================================
+//
+// Type a key in the serial monitor to export the accumulated table:
+//   d = CSV (spreadsheet-friendly),  j = JSON (one object per line)
+// The binary /fy_sess.bin isn't human-readable, so this is how you get the
+// persisted log off the device without esptool/mkspiffs.
+
+static void dumpDetectionsCSV()
+{
+  dualPrintln("mac,method,rssi,channel,count,firstSeen_ms,lastSeen_ms,lat,lon,utc,hasFix,ssid");
+  for (int i = 0; i < fyDetCount; i++)
+  {
+    FYDetection &d = fyDet[i];
+    dualPrintf("%s,%s,%d,%u,%u,%lu,%lu,%.6f,%.6f,%lu,%u,\"%s\"\n",
+               d.mac, d.method, d.rssi, (unsigned)d.channel, (unsigned)d.count,
+               (unsigned long)d.firstSeen, (unsigned long)d.lastSeen,
+               d.lat, d.lon, (unsigned long)d.utc, (unsigned)d.hasFix, d.ssid);
+  }
+  dualPrintf("[flockyou] dumped %d detections (CSV)\n", fyDetCount);
+}
+
+static void dumpDetectionsJSON()
+{
+  for (int i = 0; i < fyDetCount; i++)
+  {
+    FYDetection &d = fyDet[i];
+    char ssidEsc[sizeof(d.ssid) * 6 + 1];
+    jsonEscape(ssidEsc, sizeof(ssidEsc), d.ssid);
+    char gpsField[96];
+    if (d.hasFix)
+      snprintf(gpsField, sizeof(gpsField),
+               "\"gps\":{\"latitude\":%.6f,\"longitude\":%.6f},\"utc\":%lu,",
+               d.lat, d.lon, (unsigned long)d.utc);
+    else
+      gpsField[0] = '\0';
+    dualPrintf("{\"record\":%d,\"mac\":\"%s\",\"method\":\"%s\",\"rssi\":%d,"
+               "\"channel\":%u,\"count\":%u,%s\"ssid\":\"%s\"}\n",
+               i, d.mac, d.method, d.rssi, (unsigned)d.channel,
+               (unsigned)d.count, gpsField, ssidEsc);
+  }
+  dualPrintf("[flockyou] dumped %d detections (JSON)\n", fyDetCount);
+}
+
+// Poll USB serial for a one-key export command.
+static void serialCommandTick()
+{
+  while (Serial.available())
+  {
+    int c = Serial.read();
+    if (c == 'd' || c == 'D')
+      dumpDetectionsCSV();
+    else if (c == 'j' || c == 'J')
+      dumpDetectionsJSON();
+  }
+}
+
+// ============================================================
 // GPS READER  (NMEA over Serial1, parsed by TinyGPS++)
 // ============================================================
 #if USE_GPS
@@ -1591,6 +1649,7 @@ void setup()
 #endif
 
   dualPrintln("[flockyou] merged WiFi detector started");
+  dualPrintln("[flockyou] serial cmds: 'd'=dump table CSV, 'j'=dump table JSON");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
              channelModeName(), CHANNEL_DWELL_MS, currentChannel,
              RSSI_MIN, fySpiffsReady ? 1 : 0);
@@ -1601,9 +1660,10 @@ void setup()
 
 void loop()
 {
-  gpsTick();         // feed NMEA + refresh fix before detections are stamped
+  gpsTick();           // feed NMEA + refresh fix before detections are stamped
+  serialCommandTick(); // 'd'/'j' over USB serial exports the stored table
   updateChannelMode();
-  drainAlertQueue(); // Serial.printf happens here, not in callback
+  drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();    // periodic SPIFFS write if dirty
   heartbeatTick();   // audible beep-pair while a target is still in range
   ledTick();         // turn off LED after LED_FLASH_MS
