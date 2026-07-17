@@ -1499,6 +1499,38 @@ static void dumpDetectionsJSON()
   dualPrintf("[flockyou] dumped %d detections (JSON)\n", fyDetCount);
 }
 
+// Stream a file's raw bytes over USB serial, framed by BEGIN/END markers.
+static void dumpRawFile(const char *path)
+{
+  if (!SPIFFS.exists(path))
+  {
+    dualPrintf("[flockyou] %s: not present\n", path);
+    return;
+  }
+  File f = SPIFFS.open(path, "r");
+  if (!f)
+  {
+    dualPrintf("[flockyou] %s: open failed\n", path);
+    return;
+  }
+  dualPrintf("----- BEGIN %s (%u bytes) -----\n", path, (unsigned)f.size());
+  uint8_t buf[128];
+  int n;
+  while ((n = f.read(buf, sizeof(buf))) > 0)
+    Serial.write(buf, n);
+  f.close();
+  dualPrintf("\n----- END %s -----\n", path);
+}
+
+// Export the LEGACY JSON session files written by the pre-binary firmware.
+// Flashing doesn't delete them, so this recovers data collected before the
+// switch to /fy_sess.bin. Safe to run once and ignore afterwards.
+static void dumpLegacySessions()
+{
+  dumpRawFile("/session.json");
+  dumpRawFile("/prev_session.json");
+}
+
 // Poll USB serial for a one-key export command.
 static void serialCommandTick()
 {
@@ -1509,6 +1541,8 @@ static void serialCommandTick()
       dumpDetectionsCSV();
     else if (c == 'j' || c == 'J')
       dumpDetectionsJSON();
+    else if (c == 'o' || c == 'O')
+      dumpLegacySessions(); // recover old /session.json data after flashing
   }
 }
 
@@ -1649,7 +1683,7 @@ void setup()
 #endif
 
   dualPrintln("[flockyou] merged WiFi detector started");
-  dualPrintln("[flockyou] serial cmds: 'd'=dump table CSV, 'j'=dump table JSON");
+  dualPrintln("[flockyou] serial cmds: 'd'=dump table CSV, 'j'=dump table JSON, 'o'=export legacy /session.json");
   dualPrintf("[flockyou] mode=%s dwell_ms=%u start_channel=%u rssi_min=%d spiffs=%d\n",
              channelModeName(), CHANNEL_DWELL_MS, currentChannel,
              RSSI_MIN, fySpiffsReady ? 1 : 0);

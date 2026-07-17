@@ -38,8 +38,15 @@ GPS = Adafruit Ultimate GPS V3, 9600 NMEA, parsed by TinyGPS++. VIN→3V3, GND�
   changed from the old `/session.json`, so the first boot after flashing starts
   fresh (expected). `recSize` guard rejects mismatched-layout files.
 - **Log export:** in the serial monitor, `d` dumps the stored table as CSV, `j`
-  as JSON (`serialCommandTick()` in loop). The live per-detection JSON stream
-  also works for capture (`monitor_filters = log2file`).
+  as JSON, `o` streams the legacy `/session.json`+`/prev_session.json` raw
+  (`serialCommandTick()` in loop). The live per-detection JSON stream also works
+  for capture (`monitor_filters = log2file`).
+- **Flashing preserves SPIFFS:** a firmware upload writes only the app
+  partition; the data partition/files survive (partition table unchanged, no
+  reformat). The binary format only reads/writes `/fy_sess.bin`, so the old
+  `/session.json` is left intact and recoverable via `o` — but the new firmware
+  does NOT auto-load it (different format). Back up with esptool `read_flash
+  0x2E0000 0x120000` + mkspiffs if you want a zero-trust copy before flashing.
 - **GPS** stamps each detection's first sighting with lat/lon + UTC epoch:
   embedded in the JSON (`gps{}`+`utc`, Flask-compatible), in the human DETECT
   lines, and in the persisted record. No fix → still recorded, no geodata.
