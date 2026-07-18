@@ -4,3 +4,7 @@
 .vscode/
 
 .DS_Store
+
+# Offloaded device data: detection tables (CSV/JSON) + raw SPIFFS backups.
+# Field-collected GPS data — keep out of the repo.
+exports/
