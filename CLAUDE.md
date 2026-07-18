@@ -55,17 +55,19 @@ GPS = Adafruit Ultimate GPS V3, 9600 NMEA, parsed by TinyGPS++. VIN→3V3, GND�
   USB only — classic ESP32 HardwareSerial lacks it).
 - The file was clang-formatted (Allman braces) by the user's tooling — match it.
 
-## Status — compiles clean; runtime validation pending
-Commits `4885560` (BLE off), `2133dd3` (persistence), `1f4f1ec` (GPS) were
-authored in the web sandbox, which cannot compile or flash. **First local build
-(2026-07-14) passed with no errors or warnings** — the feared TinyGPS++ API and
-struct file-I/O breakages did not materialize. RAM 20.0% (65,592 B), flash 27.2%
-(802,965 B).
+## Status — flashed to hardware; partially validated on-device
+The sandbox-authored commits `4885560` (BLE off), `2133dd3` (persistence),
+`1f4f1ec` (GPS) all compile and run. **First local build 2026-07-14; merged
+build with log-export + LED changes flashed to the board (COM4) 2026-07-18**
+(flash 27.3%, 804,437 B; RAM 20.0%).
 
-Never flashed to hardware, so all three features are unverified on-device.
-Validate in order: (1) detection rate back to normal with BLE off;
-(2) `restored N detections` on reboot; (3) GPS `gps=fix` in the status line +
-geotags after an outdoor lock.
+Validated on-device 2026-07-18: **(2) persistence** — a `d` CSV export pulled
+back **21 geotagged detections that survived reboots**, so the reload-on-boot
+path works, and the GPS records carry real lat/lon + UTC (so **(3) GPS** logged
+fixes in the field too). Still unconfirmed by direct observation: **(1)** the
+raw detection *rate* with BLE off, and the new **2 s LED flash / boot
+color-cycle** (needs eyes on the board). Field data offloads live in `exports/`
+(gitignored) via `python tools/export_table.py`.
 
 ## Open / possible next steps
 - **Piezo loudness** — full implementation plan in
