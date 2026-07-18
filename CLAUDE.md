@@ -55,13 +55,17 @@ GPS = Adafruit Ultimate GPS V3, 9600 NMEA, parsed by TinyGPS++. VIN→3V3, GND�
   USB only — classic ESP32 HardwareSerial lacks it).
 - The file was clang-formatted (Allman braces) by the user's tooling — match it.
 
-## Status — NOT yet compiled/flashed
+## Status — compiles clean; runtime validation pending
 Commits `4885560` (BLE off), `2133dd3` (persistence), `1f4f1ec` (GPS) were
-authored in the web sandbox, which **cannot compile** (blocked toolchain
-registry) or flash. First local build may surface errors — most likely a
-TinyGPS++ API name or struct file-I/O. Validate in order: (1) detection rate
-back to normal with BLE off; (2) `restored N detections` on reboot; (3) GPS
-`gps=fix` in the status line + geotags after an outdoor lock.
+authored in the web sandbox, which cannot compile or flash. **First local build
+(2026-07-14) passed with no errors or warnings** — the feared TinyGPS++ API and
+struct file-I/O breakages did not materialize. RAM 20.0% (65,592 B), flash 27.2%
+(802,965 B).
+
+Never flashed to hardware, so all three features are unverified on-device.
+Validate in order: (1) detection rate back to normal with BLE off;
+(2) `restored N detections` on reboot; (3) GPS `gps=fix` in the status line +
+geotags after an outdoor lock.
 
 ## Open / possible next steps
 - **Piezo loudness** — full implementation plan in
