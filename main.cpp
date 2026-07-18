@@ -23,8 +23,12 @@
 // because the WS2812B is blinding at full 255.
 #define LED_PIN 2
 #define USE_LED 1
-#define LED_FLASH_MS 120
+// Long enough to catch out of the corner of your eye while driving; the flash
+// is non-blocking (ledTick() clears it), so this never stalls the sniffer.
+#define LED_FLASH_MS 2000
 #define LED_BRIGHTNESS 64
+// Boot self-test: dwell per color while stepping the detection palette.
+#define BOOT_CYCLE_MS 500
 
 // Idle "still alive" breathing glow. A slow, subtle pulse shown whenever the
 // LED isn't mid detection-flash, so a glance confirms the unit is powered and
@@ -785,6 +789,32 @@ static void alertTypeColor(AlertType t, uint8_t &r, uint8_t &g, uint8_t &b)
     b = B;
     break; // white
   }
+}
+
+// Boot self-test: step through every detection color, in the same order the
+// README/table lists them, so a glance confirms the LED works and re-learns the
+// code before driving. Blocking by design — setup() only, before the sniffer
+// starts. Colors come from alertTypeColor() so this can never drift from the
+// live mapping.
+static void ledBootColorCycle(unsigned ms)
+{
+#if USE_LED
+  static const AlertType kOrder[] = {
+      ALERT_WILDCARD_PROBE, // red
+      ALERT_OUI_ADDR2,      // amber
+      ALERT_OUI_ADDR1,      // blue
+      ALERT_OUI_ADDR3,      // cyan
+      ALERT_SSID,           // magenta
+  };
+  for (size_t i = 0; i < sizeof(kOrder) / sizeof(kOrder[0]); i++)
+  {
+    uint8_t r, g, b;
+    alertTypeColor(kOrder[i], r, g, b);
+    rgbShow(r, g, b);
+    delay(ms);
+  }
+  rgbOff();
+#endif
 }
 
 // Stamp a detection record with the current GPS fix at first sighting.
@@ -1634,7 +1664,12 @@ void setup()
 
   startupBeep();
 #if USE_LED
-  ledFlashColor(0, LED_BRIGHTNESS, 0, 200); // green boot pulse
+  // Green boot pulse, then the detection-palette self-test. Driven blocking
+  // (not via ledFlashColor) so the green actually dwells for its 200 ms instead
+  // of being overwritten by the first cycle color on the very next line.
+  rgbShow(0, LED_BRIGHTNESS, 0);
+  delay(200);
+  ledBootColorCycle(BOOT_CYCLE_MS); // ends dark
 #endif
 
   precompileOuis();
