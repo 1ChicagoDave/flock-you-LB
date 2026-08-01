@@ -85,27 +85,45 @@ static const char *sdTypeName(uint8_t t)
 {
   switch (t)
   {
-  case CARD_NONE: return "NONE (no card / not detected)";
-  case CARD_MMC: return "MMC";
-  case CARD_SD: return "SDSC";
-  case CARD_SDHC: return "SDHC/SDXC";
-  default: return "UNKNOWN";
+  case CARD_NONE:
+    return "NONE (no card / not detected)";
+  case CARD_MMC:
+    return "MMC";
+  case CARD_SD:
+    return "SDSC";
+  case CARD_SDHC:
+    return "SDHC/SDXC";
+  default:
+    return "UNKNOWN";
   }
 }
 
-// Mount the SD on its own VSPI bus. Retries slower; reports why it failed so we
-// can tell "no card / bad pins" (cardType NONE) from "bad filesystem" (a card
-// type shows but the FAT mount fails -> reformat FAT32).
-static void sdTest()
+// Mount the SD on its own VSPI bus. The ESP32 SD lib only mounts FAT16/FAT32;
+// a 64GB SDXC card is exFAT out of the box and WON'T mount (and a failed mount
+// de-inits the card, so cardType then reads NONE — misleading). allowFormat
+// reformats the card FAT32 in place (ERASES it) via format_if_mount_failed.
+static void sdMount(bool allowFormat)
 {
   tft.fillRect(0, 96, screenW, 44, TFT_BLACK);
   tft.setTextFont(2);
   tft.setCursor(6, 96);
 
-  const uint32_t freqs[] = {20000000, 4000000, 1000000, 400000};
   sdOK = false;
-  for (uint8_t i = 0; i < 4 && !sdOK; i++)
-    sdOK = SD.begin(PIN_SD_CS, sdSPI, freqs[i]);
+  if (allowFormat)
+  {
+    Serial.println("[SD] mount+format FAT32 @4MHz (ERASES the card)...");
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.print("SD: formatting FAT32...");
+    sdOK = SD.begin(PIN_SD_CS, sdSPI, 4000000, "/sd", 5, true);
+    tft.fillRect(0, 96, screenW, 44, TFT_BLACK);
+    tft.setCursor(6, 96);
+  }
+  else
+  {
+    const uint32_t freqs[] = {20000000, 4000000, 1000000, 400000};
+    for (uint8_t i = 0; i < 4 && !sdOK; i++)
+      sdOK = SD.begin(PIN_SD_CS, sdSPI, freqs[i], "/sd", 5, false);
+  }
 
   uint8_t ct = SD.cardType();
   if (sdOK)
@@ -118,13 +136,13 @@ static void sdTest()
   else
   {
     Serial.printf("[SD] mount FAILED. cardType=%s\n", sdTypeName(ct));
-    Serial.println("[SD]  cardType NONE -> reseat card / check pins.");
-    Serial.println("[SD]  cardType shown -> reformat as FAT32 (<=32GB best).");
+    Serial.println("[SD]  64GB is exFAT by default -> press 'f' to format FAT32,");
+    Serial.println("[SD]  or reformat FAT32 on PC (guiformat/Rufus, or <=32GB).");
     tft.setTextColor(TFT_RED, TFT_BLACK);
     tft.printf("SD: FAIL (%s)\n", sdTypeName(ct));
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
     tft.setCursor(6, 116);
-    tft.print(ct == CARD_NONE ? "reseat / check card" : "reformat FAT32");
+    tft.print("press 'f' to format FAT32");
   }
 }
 
@@ -170,7 +188,7 @@ static void drawHeader()
   tft.printf("ST7796S %dx%d  rot %d\n", screenW, screenH, SCREEN_ROTATION);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
   tft.setCursor(6, 64);
-  tft.println("touch=dots  keys: c=cal s=sd");
+  tft.println("touch=dots  keys: c=cal s=sd f=fmt");
 }
 
 void setup()
@@ -202,7 +220,7 @@ void setup()
 
   // microSD on its own VSPI bus
   sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
-  sdTest();
+  sdMount(false);
 
   // GPS on a remapped UART (I2C connector pins 25/32)
   Serial2.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
@@ -220,7 +238,7 @@ void setup()
 
 void loop()
 {
-  // Serial commands: recalibrate touch / re-test SD.
+  // Serial commands: c=recalibrate touch  s=re-test SD  f=format SD FAT32
   if (Serial.available())
   {
     int c = Serial.read();
@@ -228,10 +246,12 @@ void loop()
     {
       touchCalibrate(true);
       drawHeader();
-      sdTest();
+      sdMount(false);
     }
     else if (c == 's' || c == 'S')
-      sdTest();
+      sdMount(false);
+    else if (c == 'f' || c == 'F')
+      sdMount(true); // ERASES the card, reformats FAT32
   }
 
   // Touch — draw a dot where pressed, print raw coords.
