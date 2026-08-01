@@ -26,6 +26,8 @@
 #include <SD.h>
 #include <TFT_eSPI.h>
 #include <TinyGPSPlus.h>
+#include <Preferences.h> // persist rotation-specific touch calibration in NVS
+#include <math.h>
 
 // ============================================================
 // BOARD PIN MAP  (E32R40T — verified in hosyond/bringup.cpp)
@@ -52,7 +54,7 @@
 #define PIN_GPS_RX 25 // GPS on the 4-pin connector, remapped as UART2 RX
 #define PIN_GPS_TX 32 // ESP32 UART2 TX -> GPS RX
 
-#define SCREEN_ROTATION 0 // 0/2 = portrait 320x480, 1/3 = landscape 480x320
+#define SCREEN_ROTATION 1 // 0/2 = portrait 320x480, 1/3 = landscape 480x320 (UI is landscape)
 
 // ============================================================
 // CONFIG
@@ -125,6 +127,40 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 // counts survive power loss.
 #define MAX_DETECTIONS 200
 #define AUTOSAVE_INTERVAL_MS 60000
+
+// ---- Touchscreen UI (Phase 2a) ----
+// Landscape 480x320 layout. The status strip lives across the top, the active
+// screen body in the middle, and a persistent 4-tab bar along the bottom.
+#define UI_W 480
+#define UI_H 320
+#define STRIP_H 22             // shared status strip: y 0..22
+#define BODY_TOP 24            // screen body starts below the strip
+#define TABBAR_Y 276           // tab bar: y 276..320
+#define TABBAR_H (UI_H - TABBAR_Y)
+#define BODY_BOT TABBAR_Y      // body ends where the tab bar begins
+#define TAB_W (UI_W / 4)       // four equal tabs, 120 px each
+
+// Hunter refresh rates.
+#define HUNTER_UPDATE_MS 200   // radar/gauge animation ~5 Hz
+#define SLOW_UPDATE_MS 1000    // Alert/Live/Stats bodies + status strip ~1 Hz
+
+// Proximity tracking: the "strongest current target" is the highest-RSSI unique
+// device seen within this rolling window; blips fade out over BLIP_FADE_MS.
+#define PROX_WINDOW_MS 8000
+#define BLIP_FADE_MS 6000
+
+// RSSI -> gauge percent mapping (dBm).
+#define RSSI_GAUGE_MIN -95
+#define RSSI_GAUGE_MAX -40
+
+// Sonar radar geometry (a TFT_Sprite of just this square region — never a
+// full-screen buffer). 160x160x2 = 51,200 B of heap, allocated once at boot.
+#define RADAR_D 160
+#define RADAR_R (RADAR_D / 2)
+#define RADAR_X 8              // top-left of the radar sprite within the body
+#define RADAR_Y 36
+#define SWEEP_STEP_DEG 9       // sweep advance per Hunter update
+#define DEG2RAD 0.01745329252f
 
 // ============================================================
 // TARGET OUI LIST  (all lowercase, colons only)
@@ -300,11 +336,23 @@ static bool sdReady = false;
 static int fySessionNum = 0;      // NNN of the file this power-on writes
 static char fySessionPath[24];    // "/session_NNN.csv"
 
-// Most-recent detection, for the TFT status screen.
+// Most-recent detection, for the TFT UI. These are the shared "last event"
+// fields the UI observes; drainAlertQueue() writes them on every emitted hit.
 static char fyLastMac[18] = "";
 static char fyLastMethod[16] = "";
 static AlertType fyLastType = ALERT_OUI_ADDR2;
+static int8_t fyLastRssi = RSSI_MIN;
+static unsigned long fyLastEventAt = 0;
 static bool fyHaveLast = false;
+
+// Touch-calibration store (rotation-specific uint16_t cal[5] in NVS).
+static Preferences uiPrefs;
+
+// UI redraw request — set on boot, screen switch, or after recalibration.
+// Declared here (ahead of serialCommandTick, which sets it on 'k'); the rest of
+// the UI framework lives further down.
+static bool screenDirty = true;
+static void touchCalibrate(bool force);
 
 // ============================================================
 // 802.11 HEADER
@@ -1311,10 +1359,12 @@ static void drainAlertQueue()
     if (shouldSuppressDuplicate(macStr))
       continue;
 
-    // Track the latest detection for the TFT status screen.
+    // Track the latest detection for the TFT UI (shared "last event").
     strlcpy(fyLastMac, macStr, sizeof(fyLastMac));
     strlcpy(fyLastMethod, method, sizeof(fyLastMethod));
     fyLastType = e.type;
+    fyLastRssi = e.rssi;
+    fyLastEventAt = millis();
     fyHaveLast = true;
 
     // Human-readable line (for serial terminal).
@@ -1451,6 +1501,11 @@ static void serialCommandTick()
       dumpDetectionsCSV();
     else if (c == 'j' || c == 'J')
       dumpDetectionsJSON();
+    else if (c == 'k' || c == 'K')
+    {
+      touchCalibrate(true); // force re-run the corner-arrow calibration
+      screenDirty = true;   // full redraw once calibration finishes
+    }
   }
 }
 
@@ -1511,95 +1566,600 @@ static float readBatteryVolts()
 }
 
 // ============================================================
-// TFT STATUS SCREEN
+// TOUCHSCREEN UI  (Phase 2a — landscape 480x320 framework)
 // ============================================================
-// Simple text status, redrawn on each detection and about once a second. The
-// rich UI is a later phase; this just confirms the unit is alive and scanning.
+// A persistent top status strip, a switchable screen body, and a bottom tab
+// bar. The flagship SCR_HUNTER screen renders a sonar radar (in a small sprite,
+// never a full-screen buffer), an RSSI gauge, and the strongest-target readout.
+// Everything is driven from tftTick() in loop() — non-blocking, except the
+// one-time touch calibration at boot.
 
-static unsigned long tftLastAt = 0;
-static bool tftDirty = false;
+enum UiScreen
+{
+  SCR_HUNTER = 0,
+  SCR_ALERT,
+  SCR_LIVE,
+  SCR_STATS
+};
+
+static UiScreen currentScreen = SCR_HUNTER;
+// screenDirty is declared up in the STATE section (serialCommandTick sets it).
+
+static const char *kTabLabels[4] = {"HUNT", "ALERT", "LIVE", "STATS"};
+
+// Radar sonar sprite — a single small region, allocated once at boot.
+static TFT_eSprite radarSpr = TFT_eSprite(&tft);
+static bool radarSprOk = false;
+static int sweepAngle = 0;
+
+// UI cadence timers + touch-edge debounce.
+static unsigned long uiHunterAt = 0;
+static unsigned long uiSlowAt = 0;
+static unsigned long uiStripAt = 0;
+static bool touchDown = false;
+
+// Hunter dynamic caches (dirty tracking to avoid repainting steady text).
+static char huntCacheMac[18] = "";
+static bool huntCacheHadTarget = false;
+static bool huntForce = false; // force the target block to paint on screen entry
+
+// ---- small color / math helpers ----------------------------------------
+
+// Scale a 565 color's brightness by lvl (0..255) — used for blip/sweep fades.
+static uint16_t dim565(uint16_t c, uint8_t lvl)
+{
+  uint8_t r = (c >> 11) & 0x1F;
+  uint8_t g = (c >> 5) & 0x3F;
+  uint8_t b = c & 0x1F;
+  r = (uint8_t)((r * lvl) / 255);
+  g = (uint8_t)((g * lvl) / 255);
+  b = (uint8_t)((b * lvl) / 255);
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+// Green (far / weak) -> yellow -> red (near / strong) for a 0..100 percent.
+static uint16_t gaugeColor565(int pct)
+{
+  if (pct < 0)
+    pct = 0;
+  if (pct > 100)
+    pct = 100;
+  uint8_t r, g;
+  if (pct < 50)
+  {
+    r = (uint8_t)(255 * pct / 50);
+    g = 255;
+  }
+  else
+  {
+    r = 255;
+    g = (uint8_t)(255 * (100 - pct) / 50);
+  }
+  return tft.color565(r, g, 0);
+}
+
+static int rssiToPct(int rssi)
+{
+  if (rssi <= RSSI_GAUGE_MIN)
+    return 0;
+  if (rssi >= RSSI_GAUGE_MAX)
+    return 100;
+  return (int)(((long)(rssi - RSSI_GAUGE_MIN) * 100) / (RSSI_GAUGE_MAX - RSSI_GAUGE_MIN));
+}
+
+// djb2 over the MAC string — stable pseudo-angle so a device always plots at
+// the same bearing on the radar.
+static uint32_t macHash(const char *s)
+{
+  uint32_t h = 5381;
+  for (; *s; ++s)
+    h = ((h << 5) + h) + (uint8_t)*s;
+  return h;
+}
+
+// Reverse of alertTypeToMethod() — the detection table stores the method
+// string, so map it back to a class for coloring/labeling.
+static AlertType methodToAlertType(const char *m)
+{
+  if (strcmp(m, "oui_addr1") == 0)
+    return ALERT_OUI_ADDR1;
+  if (strcmp(m, "oui_addr3") == 0)
+    return ALERT_OUI_ADDR3;
+  if (strcmp(m, "ssid") == 0)
+    return ALERT_SSID;
+  if (strcmp(m, "wildcard_probe") == 0)
+    return ALERT_WILDCARD_PROBE;
+  return ALERT_OUI_ADDR2;
+}
+
+// Human label per class for the target readout (cop-show flavor).
+static const char *alertTypeLabel(AlertType t)
+{
+  switch (t)
+  {
+  case ALERT_WILDCARD_PROBE:
+    return "WILDCARD PROBE";
+  case ALERT_OUI_ADDR2:
+    return "OUI TX";
+  case ALERT_OUI_ADDR1:
+    return "OUI RX (sleeper)";
+  case ALERT_OUI_ADDR3:
+    return "OUI BSSID";
+  case ALERT_SSID:
+    return "SSID MATCH";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+// Strongest current target: highest-RSSI unique device seen within the rolling
+// PROX_WINDOW_MS. Returns a fyDet[] index, or -1 if nothing is in the window.
+// Observes the same table the detector fills — no detection logic is touched.
+static int fyStrongestTarget()
+{
+  unsigned long now = millis();
+  int best = -1;
+  int bestRssi = -128;
+  for (int i = 0; i < fyDetCount; i++)
+  {
+    if (now - fyDet[i].lastSeen > PROX_WINDOW_MS)
+      continue;
+    if (fyDet[i].rssi > bestRssi)
+    {
+      bestRssi = fyDet[i].rssi;
+      best = i;
+    }
+  }
+  return best;
+}
+
+// ---- touch calibration (rotation-specific, NVS-backed) -----------------
+
+static void touchCalibrate(bool force)
+{
+  uint16_t cal[5];
+  uiPrefs.begin("flockui", false);
+  bool have = !force && uiPrefs.getBytesLength("cal") == sizeof(cal);
+  if (have)
+  {
+    uiPrefs.getBytes("cal", cal, sizeof(cal));
+    tft.setTouch(cal);
+    dualPrintf("[flockyou] touch cal loaded: %u %u %u %u %u\n",
+               cal[0], cal[1], cal[2], cal[3], cal[4]);
+  }
+  else
+  {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextFont(2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(10, 10);
+    tft.println("Touch the corner arrows to calibrate");
+    tft.calibrateTouch(cal, TFT_MAGENTA, TFT_BLACK, 15); // blocking, boot-only
+    tft.setTouch(cal);
+    uiPrefs.putBytes("cal", cal, sizeof(cal));
+    dualPrintf("[flockyou] touch cal saved: %u %u %u %u %u\n",
+               cal[0], cal[1], cal[2], cal[3], cal[4]);
+  }
+  uiPrefs.end();
+}
+
+// ---- display + sprite init --------------------------------------------
 
 static void tftInit()
 {
   tft.init();
-  tft.setRotation(SCREEN_ROTATION);
+  tft.setRotation(SCREEN_ROTATION); // 1 => 480x320 landscape
   screenW = tft.width();
   screenH = tft.height();
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.setTextFont(4);
-  tft.setCursor(6, 6);
-  tft.println("FlockYou");
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.setCursor(6, 44);
-  tft.println("2.4GHz passive WiFi detector");
+
+  // Allocate the radar sprite once, up front while heap is least fragmented
+  // (before WiFi is started). 16bpp so pushSprite is a straight blit.
+  radarSpr.setColorDepth(16);
+  radarSprOk = (radarSpr.createSprite(RADAR_D, RADAR_D) != nullptr);
+  if (!radarSprOk)
+    dualPrintln("[flockyou] radar sprite alloc failed — radar disabled");
 }
 
-static void tftUpdate()
+// ---- shared chrome: status strip + tab bar -----------------------------
+
+static void drawStatusStrip()
 {
-  const int top = 76;
-  const int lh = 30;
-  int y = top;
-
-  tft.fillRect(0, top, screenW, screenH - top, TFT_BLACK);
-  tft.setTextFont(4);
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(6, y);
-  tft.printf("Mode %s  ch %u", channelModeName(), currentChannel);
-  y += lh;
+  tft.fillRect(0, 0, UI_W, STRIP_H, TFT_BLACK);
+  tft.drawFastHLine(0, STRIP_H, UI_W, TFT_DARKGREY);
+  tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM);
+  const int y = 3;
 
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
   tft.setCursor(6, y);
-  tft.printf("Unique: %d", fyDetCount);
-  y += lh + 6;
+  tft.print("FLOCK");
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(64, y);
+  tft.printf("ch%u", currentChannel);
+
+  tft.setTextColor(gpsHasFix ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
+  tft.setCursor(116, y);
+  tft.printf("GPS:%s/%u", gpsHasFix ? "fix" : "no", (unsigned)gpsSats);
+
+  tft.setTextColor(sdReady ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  tft.setCursor(230, y);
+  tft.printf("SD:%s", sdReady ? "ok" : "--");
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(300, y);
+  tft.printf("%.2fV", readBatteryVolts());
+
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(400, y);
+  tft.printf("U:%d", fyDetCount);
+}
+
+static void drawTabBar()
+{
+  tft.setTextFont(4);
+  tft.setTextDatum(MC_DATUM);
+  for (int i = 0; i < 4; i++)
+  {
+    int x = i * TAB_W;
+    bool active = (i == (int)currentScreen);
+    uint16_t bg = active ? TFT_DARKCYAN : TFT_BLACK;
+    uint16_t fg = active ? TFT_BLACK : TFT_CYAN;
+    tft.fillRect(x, TABBAR_Y, TAB_W, TABBAR_H, bg);
+    tft.drawRect(x, TABBAR_Y, TAB_W, TABBAR_H, TFT_DARKGREY);
+    tft.setTextColor(fg, bg);
+    tft.drawString(kTabLabels[i], x + TAB_W / 2, TABBAR_Y + TABBAR_H / 2);
+  }
+  tft.setTextDatum(TL_DATUM);
+}
+
+// ---- SCR_HUNTER --------------------------------------------------------
+
+static void drawRadar()
+{
+  const int cx = RADAR_R, cy = RADAR_R;
+  unsigned long now = millis();
+
+  if (!radarSprOk)
+  {
+    sweepAngle += SWEEP_STEP_DEG;
+    if (sweepAngle >= 360)
+      sweepAngle -= 360;
+    return;
+  }
+
+  radarSpr.fillSprite(TFT_BLACK);
+
+  // faint range rings + crosshair
+  for (int k = 1; k <= 3; k++)
+    radarSpr.drawCircle(cx, cy, RADAR_R * k / 3, dim565(TFT_GREEN, 70));
+  radarSpr.drawCircle(cx, cy, RADAR_R - 1, dim565(TFT_GREEN, 140));
+  radarSpr.drawFastHLine(0, cy, RADAR_D, dim565(TFT_GREEN, 40));
+  radarSpr.drawFastVLine(cx, 0, RADAR_D, dim565(TFT_GREEN, 40));
+
+  // sweep line + comet trail
+  for (int t = 0; t < 8; t++)
+  {
+    float a = (sweepAngle - t * 5) * DEG2RAD;
+    uint8_t lvl = (uint8_t)(220 - t * 26);
+    int ex = cx + (int)(cosf(a) * (RADAR_R - 2));
+    int ey = cy + (int)(sinf(a) * (RADAR_R - 2));
+    radarSpr.drawLine(cx, cy, ex, ey, dim565(TFT_GREEN, lvl));
+  }
+
+  // blips straight from the live detection table (recent, fading by age).
+  // angle = hash(MAC), radius = closer-to-center for stronger RSSI.
+  for (int i = 0; i < fyDetCount; i++)
+  {
+    unsigned long age = now - fyDet[i].lastSeen;
+    if (age > BLIP_FADE_MS)
+      continue;
+    int pct = rssiToPct(fyDet[i].rssi);
+    float a = (macHash(fyDet[i].mac) % 360) * DEG2RAD;
+    float rr = (RADAR_R - 6) * (1.0f - pct / 100.0f * 0.85f);
+    int bx = cx + (int)(cosf(a) * rr);
+    int by = cy + (int)(sinf(a) * rr);
+    uint8_t lvl = (uint8_t)(255 - (age * 255 / BLIP_FADE_MS));
+    uint16_t col = dim565(gaugeColor565(pct), lvl);
+    radarSpr.fillCircle(bx, by, 3, col);
+    if (age < 1200)
+      radarSpr.drawCircle(bx, by, 5, dim565(col, 180)); // fresh-ping halo
+  }
+
+  radarSpr.pushSprite(RADAR_X, RADAR_Y);
+
+  sweepAngle += SWEEP_STEP_DEG;
+  if (sweepAngle >= 360)
+    sweepAngle -= 360;
+}
+
+static void drawHunterStatic()
+{
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
 
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.setCursor(6, y);
-  tft.print("Last hit:");
-  y += lh;
-  if (fyHaveLast)
+  tft.setCursor(RADAR_X + RADAR_R - 20, RADAR_Y + RADAR_D + 3);
+  tft.print("SONAR");
+
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(190, 30);
+  tft.print("SIGNAL");
+  tft.drawRect(190, 52, 280, 30, TFT_DARKGREY); // gauge frame
+
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(190, 150);
+  tft.print("TARGET");
+}
+
+static void updateHunter()
+{
+  int ti = fyStrongestTarget();
+  bool haveTarget = (ti >= 0);
+  int rssi = haveTarget ? fyDet[ti].rssi : RSSI_GAUGE_MIN;
+  int pct = rssiToPct(rssi);
+
+  // sonar radar (animated, in its sprite)
+  drawRadar();
+
+  // RSSI gauge bar
+  const int gx = 192, gy = 54, gw = 276, gh = 26;
+  int fillw = gw * pct / 100;
+  uint16_t gc = gaugeColor565(pct);
+  tft.fillRect(gx, gy, fillw, gh, haveTarget ? gc : TFT_BLACK);
+  tft.fillRect(gx + fillw, gy, gw - fillw, gh, TFT_BLACK);
+
+  // big dBm readout
+  tft.fillRect(190, 92, 200, 50, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setCursor(190, 92);
+  if (haveTarget)
   {
-    tft.setTextColor(alertTftColor(fyLastType), TFT_BLACK);
-    tft.setCursor(6, y);
-    tft.print(fyLastMac);
-    y += lh;
-    tft.setCursor(6, y);
-    tft.print(fyLastMethod);
-    y += lh + 6;
+    tft.setTextFont(6);
+    tft.setTextColor(gc, TFT_BLACK);
+    tft.printf("%d", rssi);
+    tft.setTextFont(2);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setCursor(300, 122);
+    tft.print("dBm");
   }
   else
   {
+    tft.setTextFont(6);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.setCursor(6, y);
-    tft.print("(none yet)");
-    y += 2 * lh + 6;
+    tft.print("--");
   }
 
-  tft.setTextColor(gpsHasFix ? TFT_GREEN : TFT_ORANGE, TFT_BLACK);
-  tft.setCursor(6, y);
-  tft.printf("GPS: %s  sats %u", gpsHasFix ? "fix" : "no fix", (unsigned)gpsSats);
-  y += lh;
+  // target readout — MAC + class label repainted only when it changes.
+  const char *tmac = haveTarget ? fyDet[ti].mac : "";
+  bool changed = huntForce || (haveTarget != huntCacheHadTarget) ||
+                 (haveTarget && strcmp(tmac, huntCacheMac) != 0);
+  huntForce = false;
+  if (changed)
+  {
+    tft.fillRect(190, 172, 285, 50, TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    if (haveTarget)
+    {
+      AlertType t = methodToAlertType(fyDet[ti].method);
+      tft.setTextFont(4);
+      tft.setTextColor(alertTftColor(t), TFT_BLACK);
+      tft.setCursor(190, 172);
+      tft.print(fyDet[ti].mac);
+      tft.setTextFont(2);
+      tft.setTextColor(alertTftColor(t), TFT_BLACK);
+      tft.setCursor(190, 200);
+      tft.print(alertTypeLabel(t));
+      strlcpy(huntCacheMac, tmac, sizeof(huntCacheMac));
+    }
+    else
+    {
+      tft.setTextFont(4);
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.setCursor(190, 172);
+      tft.print("NO TARGET");
+      huntCacheMac[0] = '\0';
+    }
+    huntCacheHadTarget = haveTarget;
+  }
 
-  tft.setTextColor(sdReady ? TFT_GREEN : TFT_RED, TFT_BLACK);
-  tft.setCursor(6, y);
-  tft.printf("SD: %s", sdReady ? "OK" : "FAIL");
-  y += lh;
+  // keep the idle "scanning ch N" line fresh as channels hop
+  if (!haveTarget)
+  {
+    tft.fillRect(190, 200, 285, 18, TFT_BLACK);
+    tft.setTextFont(2);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setCursor(190, 200);
+    tft.printf("scanning ch %u ...", currentChannel);
+  }
+}
 
+// ---- SCR_ALERT / SCR_LIVE / SCR_STATS (2b/2c placeholders) -------------
+
+static void drawAlertStatic()
+{
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_RED, TFT_BLACK);
+  tft.setCursor(10, BODY_TOP + 10);
+  tft.print("ALERTS");
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(10, BODY_TOP + 44);
+  tft.print("(2b) live alert feed lands here");
+}
+
+static void updateAlert()
+{
+  tft.fillRect(0, BODY_TOP + 70, UI_W, 40, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setCursor(10, BODY_TOP + 74);
+  if (fyHaveLast)
+  {
+    tft.setTextColor(alertTftColor(fyLastType), TFT_BLACK);
+    tft.printf("Last: %s  %s  %ddBm", fyLastMac, alertTypeLabel(fyLastType),
+               (int)fyLastRssi);
+  }
+  else
+  {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.print("no active alert");
+  }
+}
+
+static void drawLiveStatic()
+{
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(10, BODY_TOP + 10);
+  tft.print("LIVE");
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(10, BODY_TOP + 44);
+  tft.print("(2c) scrolling detection list lands here");
+}
+
+static void updateLive()
+{
+  tft.fillRect(0, BODY_TOP + 70, UI_W, 40, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(4);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(6, y);
-  tft.printf("Vbat: %.2f V", readBatteryVolts());
+  tft.setCursor(10, BODY_TOP + 74);
+  tft.printf("%d detections", fyDetCount);
+}
+
+static void drawStatsStatic()
+{
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(10, BODY_TOP + 10);
+  tft.print("STATS");
+}
+
+static void updateStats()
+{
+  tft.fillRect(0, BODY_TOP + 70, UI_W, 80, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(10, BODY_TOP + 74);
+  tft.printf("Unique: %d", fyDetCount);
+  unsigned long s = millis() / 1000;
+  tft.setCursor(10, BODY_TOP + 104);
+  tft.printf("Uptime: %02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+}
+
+// ---- dispatch: full redraw, dynamic update, touch, tick ----------------
+
+static void drawScreenFull()
+{
+  tft.fillRect(0, BODY_TOP, UI_W, BODY_BOT - BODY_TOP, TFT_BLACK);
+  drawStatusStrip();
+  switch (currentScreen)
+  {
+  case SCR_HUNTER:
+    huntCacheMac[0] = '\0';
+    huntCacheHadTarget = false;
+    huntForce = true; // guarantee the target block paints on entry
+    drawHunterStatic();
+    break;
+  case SCR_ALERT:
+    drawAlertStatic();
+    break;
+  case SCR_LIVE:
+    drawLiveStatic();
+    break;
+  case SCR_STATS:
+    drawStatsStatic();
+    break;
+  }
+  drawTabBar();
+}
+
+static void updateCurrentScreen()
+{
+  switch (currentScreen)
+  {
+  case SCR_HUNTER:
+    updateHunter();
+    break;
+  case SCR_ALERT:
+    updateAlert();
+    break;
+  case SCR_LIVE:
+    updateLive();
+    break;
+  case SCR_STATS:
+    updateStats();
+    break;
+  }
+}
+
+static void handleTouch()
+{
+  uint16_t tx, ty;
+  bool pressed = tft.getTouch(&tx, &ty);
+  if (pressed && !touchDown)
+  {
+    touchDown = true; // act on the press edge only
+    if (ty >= TABBAR_Y)
+    {
+      int idx = tx / TAB_W;
+      if (idx < 0)
+        idx = 0;
+      if (idx > 3)
+        idx = 3;
+      if ((int)currentScreen != idx)
+      {
+        currentScreen = (UiScreen)idx;
+        screenDirty = true;
+      }
+    }
+  }
+  else if (!pressed)
+  {
+    touchDown = false;
+  }
 }
 
 static void tftTick()
 {
+  handleTouch();
   unsigned long now = millis();
-  if (tftDirty || now - tftLastAt >= 1000)
+
+  if (screenDirty)
   {
-    tftUpdate();
-    tftLastAt = now;
-    tftDirty = false;
+    drawScreenFull();
+    updateCurrentScreen(); // paint one dynamic frame immediately
+    screenDirty = false;
+    uiHunterAt = uiSlowAt = uiStripAt = now;
+    return;
+  }
+
+  // shared status strip ~1 Hz on every screen
+  if (now - uiStripAt >= SLOW_UPDATE_MS)
+  {
+    drawStatusStrip();
+    uiStripAt = now;
+  }
+
+  if (currentScreen == SCR_HUNTER)
+  {
+    if (now - uiHunterAt >= HUNTER_UPDATE_MS)
+    {
+      updateHunter();
+      uiHunterAt = now;
+    }
+  }
+  else if (now - uiSlowAt >= SLOW_UPDATE_MS)
+  {
+    updateCurrentScreen();
+    uiSlowAt = now;
   }
 }
 
@@ -1645,6 +2205,11 @@ void setup()
   // Display first, so status is visible during the rest of bring-up.
   tftInit();
 
+  // Rotation-specific touch calibration: load from NVS, or run the blocking
+  // corner-arrow routine on first boot / after 'k'. Boot-only, so the one
+  // long block here is acceptable.
+  touchCalibrate(false);
+
   // Boot self-test: startup jingle + green pulse + detection-palette cycle.
   startupBeep();
   rgbShow(0, LED_BRIGHTNESS, 0);
@@ -1688,7 +2253,7 @@ void setup()
 
   lastHeartbeat = millis();
   fyLastSaveAt = millis();
-  tftDirty = true; // draw the first status frame immediately
+  screenDirty = true; // draw the first UI frame immediately
 }
 
 void loop()
