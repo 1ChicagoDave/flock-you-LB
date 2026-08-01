@@ -189,7 +189,7 @@ static uint8_t oui_bytes[OUI_COUNT][3];
 // ALERT QUEUE  (callback → loop, avoids Serial in WiFi task)
 // ============================================================
 
-#define ALERT_QUEUE_SIZE 32
+#define ALERT_QUEUE_SIZE 64
 
 typedef enum : uint8_t
 {
@@ -218,6 +218,13 @@ static volatile size_t alertHead = 0; // written by callback
 static volatile size_t alertTail = 0; // read by loop()
 static portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
 
+// RF / throughput diagnostics — tell weak-RX hardware (low pkt rate, RSSI near
+// the floor) apart from UI starvation (alerts dropped because loop() is behind
+// draining the queue). Declared here so enqueueAlert/wifiSniffer can see them.
+static volatile uint32_t fyPktSeen = 0;       // frames the sniffer processed
+static volatile uint32_t fyAlertsEnqueued = 0; // matched hits queued
+static volatile uint32_t fyAlertsDropped = 0;  // matched hits lost (queue full)
+
 static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t *mac, int8_t rssi,
                                    uint8_t ch, const char *ssid, const char *kind)
 {
@@ -225,6 +232,7 @@ static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t *mac, int8_t rs
   size_t next = (alertHead + 1) % ALERT_QUEUE_SIZE;
   if (next == alertTail)
   { // drop if full — loop() is behind
+    fyAlertsDropped++;
     portEXIT_CRITICAL_ISR(&queueMux);
     return;
   }
@@ -256,6 +264,7 @@ static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t *mac, int8_t rs
   }
 
   alertHead = next;
+  fyAlertsEnqueued++;
   portEXIT_CRITICAL_ISR(&queueMux);
 }
 
@@ -344,6 +353,19 @@ static AlertType fyLastType = ALERT_OUI_ADDR2;
 static int8_t fyLastRssi = RSSI_MIN;
 static unsigned long fyLastEventAt = 0;
 static bool fyHaveLast = false;
+
+// Front-facing detection flash: the whole screen flashes the class color with
+// big text on each hit — the only onboard LED is on the BACK, dead-center, and
+// is nearly invisible in daylight. Set in drainAlertQueue, rendered by tftTick.
+#define FLASH_HOLD_MS 700
+#ifndef TFT_BL
+#define TFT_BL 27 // LCD backlight (also set via build_flags); LOW = off
+#endif
+static unsigned long uiFlashUntil = 0;
+static uint16_t uiFlashColor = 0;      // class color (565) — full-screen fill
+static uint16_t uiFlashText = 0xFFFF;  // contrasting text color
+static bool uiFlashPainted = false;
+static bool uiBlanked = false;         // 'b' test: backlight off to check RF desense
 
 // Touch-calibration store (rotation-specific uint16_t cal[5] in NVS).
 static Preferences uiPrefs;
@@ -1190,6 +1212,8 @@ static void IRAM_ATTR wifiSniffer(void *buf, wifi_promiscuous_pkt_type_t type)
   return; // nothing configured to process
 #endif
 
+  fyPktSeen++; // RX-activity counter (diagnostics)
+
   wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
   if (pkt->rx_ctrl.sig_len < sizeof(wifi_ieee80211_mac_hdr_t))
     return;
@@ -1409,6 +1433,14 @@ static void drainAlertQueue()
     alertTypeColor(e.type, lr, lg, lb);
     ledFlashColor(lr, lg, lb, LED_FLASH_MS);
 
+    // Front-facing screen flash in the same class color (the back LED is
+    // near-invisible in daylight). Rendered by tftTick; text auto-contrasts.
+    uiFlashColor = tft.color565(lr, lg, lb);
+    int luma = (lr * 30 + lg * 59 + lb * 11) / 100;
+    uiFlashText = (luma > 110) ? TFT_BLACK : TFT_WHITE;
+    uiFlashUntil = millis() + FLASH_HOLD_MS;
+    uiFlashPainted = false;
+
 #if STOP_ON_OUI_HIT
     if (e.type != ALERT_SSID)
       stopSniffing("OUI hit");
@@ -1505,6 +1537,17 @@ static void serialCommandTick()
     {
       touchCalibrate(true); // force re-run the corner-arrow calibration
       screenDirty = true;   // full redraw once calibration finishes
+    }
+    else if (c == 'b' || c == 'B')
+    {
+      // RF-desense test: blank the display + backlight. If detection improves
+      // with the screen off, the LCD is desensitizing the 2.4 GHz receiver.
+      uiBlanked = !uiBlanked;
+      pinMode(TFT_BL, OUTPUT);
+      digitalWrite(TFT_BL, uiBlanked ? LOW : HIGH);
+      if (!uiBlanked)
+        screenDirty = true;
+      dualPrintf("[flockyou] display %s\n", uiBlanked ? "BLANKED (RF test)" : "on");
     }
   }
 }
@@ -2127,10 +2170,47 @@ static void handleTouch()
   }
 }
 
+// Full-screen detection flash — front-facing alert in the class color.
+static void drawDetectionFlash()
+{
+  tft.fillScreen(uiFlashColor);
+  tft.setTextColor(uiFlashText, uiFlashColor);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.drawString("FLOCK DETECTED", UI_W / 2, 55);
+  tft.drawString(fyLastMac, UI_W / 2, 130);
+  char sub[48];
+  snprintf(sub, sizeof(sub), "%s   %d dBm", fyLastMethod, (int)fyLastRssi);
+  tft.drawString(sub, UI_W / 2, 200);
+  tft.setTextDatum(TL_DATUM); // restore default
+}
+
 static void tftTick()
 {
-  handleTouch();
   unsigned long now = millis();
+
+  // Display blanked for the RF-desense test ('b') — draw nothing.
+  if (uiBlanked)
+    return;
+
+  // Detection flash owns the whole screen for FLASH_HOLD_MS. Painted once, then
+  // we restore the normal screen when it expires.
+  if (now < uiFlashUntil)
+  {
+    if (!uiFlashPainted)
+    {
+      drawDetectionFlash();
+      uiFlashPainted = true;
+    }
+    return;
+  }
+  if (uiFlashPainted)
+  {
+    uiFlashPainted = false;
+    screenDirty = true; // restore the normal UI after the flash
+  }
+
+  handleTouch();
 
   if (screenDirty)
   {
@@ -2256,17 +2336,39 @@ void setup()
   screenDirty = true; // draw the first UI frame immediately
 }
 
+// Every 5 s: packet rate + queue drops + heap. The key hardware-vs-software
+// tell — drops>0 means the UI is starving the drain; drops~0 with a low pkt/s
+// and floor-hugging RSSI means weak RX (antenna / display desense).
+static unsigned long fyDiagAt = 0;
+static uint32_t fyPktPrev = 0;
+static void diagTick()
+{
+  unsigned long now = millis();
+  if (now - fyDiagAt < 5000)
+    return;
+  unsigned long dt = now - fyDiagAt;
+  fyDiagAt = now;
+  uint32_t pkt = fyPktSeen;
+  uint32_t rate = (uint32_t)((uint64_t)(pkt - fyPktPrev) * 1000UL / (dt ? dt : 1));
+  fyPktPrev = pkt;
+  dualPrintf("[diag] pkt/s=%lu total=%lu enq=%lu dropped=%lu uniq=%d heap=%u\n",
+             (unsigned long)rate, (unsigned long)pkt,
+             (unsigned long)fyAlertsEnqueued, (unsigned long)fyAlertsDropped,
+             fyDetCount, (unsigned)ESP.getFreeHeap());
+}
+
 void loop()
 {
   gpsTick();           // feed NMEA + refresh fix before detections are stamped
-  serialCommandTick(); // 'd'/'j' over USB serial exports the stored table
+  serialCommandTick(); // 'd'/'j'/'k'/'b' over USB serial
   updateChannelMode();
   drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();      // periodic SD CSV write if dirty
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
   breatheTick();       // subtle idle "still alive" blink between detections
-  tftTick();           // refresh the status screen (~1 Hz + on detection)
+  tftTick();           // refresh the UI (+ full-screen detection flash)
+  diagTick();          // 5 s RF/throughput diagnostics to serial
   printHeartbeat();
   delay(1);
 }
