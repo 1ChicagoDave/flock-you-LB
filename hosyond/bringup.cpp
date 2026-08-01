@@ -7,16 +7,22 @@
 //     pio run -e hosyond_e32r40t -t upload
 // then open the serial monitor at 115200 and watch the screen.
 //
+// Serial keys:  c = re-run touch calibration   s = re-test the SD card
+//
 // Board: LCDWIKI E32R40T (ESP32-32E / ST7796S 320x480 / XPT2046 resistive /
 // microSD / SC8002B speaker amp / RGB LED / Li-battery via TP4054).
 // Pin map: official spec §4.2 + schematic. See docs / memory for the table.
 // ----------------------------------------------------------------------------
 
 #include <Arduino.h>
+#include <Preferences.h> // persist touch calibration in NVS
 #include <SPI.h>
 #include <SD.h>
 #include <TFT_eSPI.h> // display + XPT2046 touch (pins come from build_flags)
 #include <TinyGPSPlus.h>
+
+// Screen rotation: 0/2 = portrait (320x480), 1/3 = landscape (480x320).
+#define SCREEN_ROTATION 0
 
 // ---- Pins NOT owned by TFT_eSPI (those are set via build_flags) -------------
 #define PIN_LED_R 22 // RGB LED, common anode: drive LOW to light
@@ -39,10 +45,12 @@
 static TFT_eSPI tft = TFT_eSPI();
 static TinyGPSPlus gps;
 static SPIClass sdSPI(VSPI);
+static Preferences prefs;
 
 static bool sdOK = false;
 static uint32_t gpsChars = 0;
 static unsigned long lastStatus = 0;
+static int screenW = 320, screenH = 480;
 
 // Light one RGB color (common anode -> LOW = on). Pass 0/1 per channel.
 static void rgb(bool r, bool g, bool b)
@@ -73,6 +81,98 @@ static float readBatteryVolts()
   return (analogReadMilliVolts(PIN_BAT_ADC) * 2.0f) / 1000.0f;
 }
 
+static const char *sdTypeName(uint8_t t)
+{
+  switch (t)
+  {
+  case CARD_NONE: return "NONE (no card / not detected)";
+  case CARD_MMC: return "MMC";
+  case CARD_SD: return "SDSC";
+  case CARD_SDHC: return "SDHC/SDXC";
+  default: return "UNKNOWN";
+  }
+}
+
+// Mount the SD on its own VSPI bus. Retries slower; reports why it failed so we
+// can tell "no card / bad pins" (cardType NONE) from "bad filesystem" (a card
+// type shows but the FAT mount fails -> reformat FAT32).
+static void sdTest()
+{
+  tft.fillRect(0, 96, screenW, 44, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setCursor(6, 96);
+
+  const uint32_t freqs[] = {20000000, 4000000, 1000000, 400000};
+  sdOK = false;
+  for (uint8_t i = 0; i < 4 && !sdOK; i++)
+    sdOK = SD.begin(PIN_SD_CS, sdSPI, freqs[i]);
+
+  uint8_t ct = SD.cardType();
+  if (sdOK)
+  {
+    uint64_t mb = SD.cardSize() / (1024ULL * 1024ULL);
+    Serial.printf("[SD] mounted: %s, %llu MB\n", sdTypeName(ct), mb);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.printf("SD: OK  %s  %llu MB", sdTypeName(ct), mb);
+  }
+  else
+  {
+    Serial.printf("[SD] mount FAILED. cardType=%s\n", sdTypeName(ct));
+    Serial.println("[SD]  cardType NONE -> reseat card / check pins.");
+    Serial.println("[SD]  cardType shown -> reformat as FAT32 (<=32GB best).");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.printf("SD: FAIL (%s)\n", sdTypeName(ct));
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.setCursor(6, 116);
+    tft.print(ct == CARD_NONE ? "reseat / check card" : "reformat FAT32");
+  }
+}
+
+// Touch calibration. Stored in NVS so it only runs once; press 'c' to redo.
+static void touchCalibrate(bool force)
+{
+  uint16_t cal[5];
+  prefs.begin("bringup", false);
+  bool have = !force && prefs.getBytesLength("touchcal") == sizeof(cal);
+  if (have)
+  {
+    prefs.getBytes("touchcal", cal, sizeof(cal));
+    tft.setTouch(cal);
+    Serial.printf("[touch] loaded cal: %u %u %u %u %u\n",
+                  cal[0], cal[1], cal[2], cal[3], cal[4]);
+  }
+  else
+  {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextFont(2);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setCursor(10, 10);
+    tft.println("Touch the arrow corners");
+    tft.calibrateTouch(cal, TFT_MAGENTA, TFT_BLACK, 15);
+    prefs.putBytes("touchcal", cal, sizeof(cal));
+    Serial.printf("[touch] NEW cal (baked into app later): %u %u %u %u %u\n",
+                  cal[0], cal[1], cal[2], cal[3], cal[4]);
+  }
+  prefs.end();
+}
+
+// Redraw the static header after a full-screen clear (calibration etc.).
+static void drawHeader()
+{
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setTextFont(4);
+  tft.setCursor(6, 6);
+  tft.println("E32R40T bring-up");
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(6, 40);
+  tft.printf("ST7796S %dx%d  rot %d\n", screenW, screenH, SCREEN_ROTATION);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setCursor(6, 64);
+  tft.println("touch=dots  keys: c=cal s=sd");
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -93,32 +193,16 @@ void setup()
 
   // Display
   tft.init();
-  tft.setRotation(0); // 0 = portrait 320x480; try 1-3 if orientation is wrong
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.setTextFont(4);
-  tft.setCursor(6, 6);
-  tft.println("E32R40T bring-up");
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.printf("ST7796S 320x480 @ HSPI\n");
+  tft.setRotation(SCREEN_ROTATION);
+  screenW = tft.width();
+  screenH = tft.height();
+
+  touchCalibrate(false); // may draw a full-screen calibration the first time
+  drawHeader();
 
   // microSD on its own VSPI bus
   sdSPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
-  sdOK = SD.begin(PIN_SD_CS, sdSPI);
-  if (sdOK)
-  {
-    uint64_t mb = SD.cardSize() / (1024ULL * 1024ULL);
-    Serial.printf("[SD] mounted, %llu MB\n", mb);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.printf("SD: OK (%llu MB)\n", mb);
-  }
-  else
-  {
-    Serial.println("[SD] mount FAILED (card in? FAT32?)");
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.printf("SD: FAILED\n");
-  }
+  sdTest();
 
   // GPS on a remapped UART (I2C connector pins 25/32)
   Serial2.begin(9600, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
@@ -131,14 +215,25 @@ void setup()
   delay(60);
   beep(2600, 120);
 
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.setTextFont(2);
-  tft.println("\nTouch the screen ->");
   Serial.println("[setup] done. Touch the screen; status prints below.");
 }
 
 void loop()
 {
+  // Serial commands: recalibrate touch / re-test SD.
+  if (Serial.available())
+  {
+    int c = Serial.read();
+    if (c == 'c' || c == 'C')
+    {
+      touchCalibrate(true);
+      drawHeader();
+      sdTest();
+    }
+    else if (c == 's' || c == 'S')
+      sdTest();
+  }
+
   // Touch — draw a dot where pressed, print raw coords.
   uint16_t tx, ty;
   if (tft.getTouch(&tx, &ty))
@@ -170,10 +265,10 @@ void loop()
     Serial.printf("[status] Vbat=%.2fV  gpsChars=%lu  fix=%s  sats=%d\n",
                   vbat, gpsChars, gps.location.isValid() ? "yes" : "no", sats);
 
-    tft.fillRect(0, 452, 320, 28, TFT_NAVY);
+    tft.fillRect(0, screenH - 28, screenW, 28, TFT_NAVY);
     tft.setTextColor(TFT_WHITE, TFT_NAVY);
     tft.setTextFont(2);
-    tft.setCursor(6, 456);
+    tft.setCursor(6, screenH - 24);
     tft.printf("Vbat %.2fV  GPS bytes %lu  sats %d", vbat, gpsChars, sats);
   }
 }
