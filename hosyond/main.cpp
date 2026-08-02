@@ -354,6 +354,12 @@ static int8_t fyLastRssi = RSSI_MIN;
 static unsigned long fyLastEventAt = 0;
 static bool fyHaveLast = false;
 
+// Session RSSI extremes for the on-screen STATS dashboard. dBm is negative, so
+// "strongest" = the largest (closest to 0) value seen. Sentinels mean "unset".
+static int8_t fyRssiLast = 0;   // last emitted detection RSSI
+static int8_t fyRssiMax = -128; // strongest detection this session
+static int8_t fyRssiMin = 127;  // weakest detection this session
+
 // Front-facing detection flash: the whole screen flashes the class color with
 // big text on each hit — the only onboard LED is on the BACK, dead-center, and
 // is nearly invisible in daylight. Set in drainAlertQueue, rendered by tftTick.
@@ -1388,6 +1394,12 @@ static void drainAlertQueue()
     strlcpy(fyLastMethod, method, sizeof(fyLastMethod));
     fyLastType = e.type;
     fyLastRssi = e.rssi;
+    // Track session RSSI last/strongest/weakest for the STATS dashboard.
+    fyRssiLast = e.rssi;
+    if (e.rssi > fyRssiMax)
+      fyRssiMax = e.rssi;
+    if (e.rssi < fyRssiMin)
+      fyRssiMin = e.rssi;
     fyLastEventAt = millis();
     fyHaveLast = true;
 
@@ -2075,26 +2087,171 @@ static void updateLive()
   tft.printf("%d detections", fyDetCount);
 }
 
+// ---- STATS: on-screen diagnostics dashboard ----------------------------
+//
+// A no-PC diagnostics view. Two-column label/value grid in the body region
+// (y ~30..214), two full-width lines for GPS + SD, and a "SCREEN OFF" button
+// (bottom-right) for the RF-desense test. To avoid flicker the static labels
+// and the button are painted once (drawStatsStatic); the ~1 Hz slow path
+// repaints only the value cells (updateStats).
+
+#define ST_ROW0 30        // first grid row (top) within the body
+#define ST_ROWH 33        // grid row pitch
+#define ST_LVAL 150       // left-column value x
+#define ST_RLAB 270       // right-column label x
+#define ST_RVAL 390       // right-column value x
+#define ST_GPS_Y 168      // GPS full-width line y
+#define ST_SD_Y 194       // SD full-width line y
+
+// SCREEN OFF button (RF-desense test) — bottom-right, above the tab bar.
+#define ST_BTN_X 300
+#define ST_BTN_Y 220
+#define ST_BTN_W 172
+#define ST_BTN_H 50
+
+static inline bool statsBlankBtnHit(uint16_t tx, uint16_t ty)
+{
+  return tx >= ST_BTN_X && tx < (ST_BTN_X + ST_BTN_W) &&
+         ty >= ST_BTN_Y && ty < (ST_BTN_Y + ST_BTN_H);
+}
+
+// On-screen packet-rate sampler (~1 Hz), independent of the 5 s serial diagTick.
+static unsigned long fyUiRateAt = 0;
+static uint32_t fyUiPktPrev = 0;
+static uint32_t fyUiPktRate = 0;
+
 static void drawStatsStatic()
 {
   tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+
+  // Left-column labels.
+  tft.setCursor(8, ST_ROW0 + 6);
+  tft.print("Devices");
+  tft.setCursor(8, ST_ROW0 + ST_ROWH + 6);
+  tft.print("Pkt/s");
+  tft.setCursor(8, ST_ROW0 + 2 * ST_ROWH + 6);
+  tft.print("Alerts dropped");
+  tft.setCursor(8, ST_ROW0 + 3 * ST_ROWH + 6);
+  tft.print("Uptime");
+
+  // Right-column labels.
+  tft.setCursor(ST_RLAB, ST_ROW0 + 6);
+  tft.print("Vbat");
+  tft.setCursor(ST_RLAB, ST_ROW0 + ST_ROWH + 6);
+  tft.print("RSSI last");
+  tft.setCursor(ST_RLAB, ST_ROW0 + 2 * ST_ROWH + 6);
+  tft.print("RSSI strong");
+  tft.setCursor(ST_RLAB, ST_ROW0 + 3 * ST_ROWH + 6);
+  tft.print("RSSI weak");
+
+  // SCREEN OFF button (static — appearance never changes).
+  tft.fillRoundRect(ST_BTN_X, ST_BTN_Y, ST_BTN_W, ST_BTN_H, 6, TFT_NAVY);
+  tft.drawRoundRect(ST_BTN_X, ST_BTN_Y, ST_BTN_W, ST_BTN_H, 6, TFT_CYAN);
+  tft.setTextDatum(MC_DATUM);
   tft.setTextFont(4);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.setCursor(10, BODY_TOP + 10);
-  tft.print("STATS");
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.drawString("SCREEN OFF", ST_BTN_X + ST_BTN_W / 2, ST_BTN_Y + 18);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_CYAN, TFT_NAVY);
+  tft.drawString("tap to wake / RF test", ST_BTN_X + ST_BTN_W / 2, ST_BTN_Y + 38);
+  tft.setTextDatum(TL_DATUM);
+}
+
+// Print one right-aligned-ish value into a cleared cell in the given font.
+static void statsValue(int x, int y, int w, uint8_t font, uint16_t color,
+                       const char *text)
+{
+  tft.fillRect(x, y - 2, w, 30, TFT_BLACK);
+  tft.setTextFont(font);
+  tft.setTextColor(color, TFT_BLACK);
+  tft.setCursor(x, y);
+  tft.print(text);
 }
 
 static void updateStats()
 {
-  tft.fillRect(0, BODY_TOP + 70, UI_W, 80, TFT_BLACK);
+  char buf[64];
+
+  // Refresh the ~1 Hz packet-rate estimate (this path runs at SLOW_UPDATE_MS).
+  unsigned long now = millis();
+  unsigned long dt = now - fyUiRateAt;
+  if (dt >= 900)
+  {
+    uint32_t pkt = fyPktSeen;
+    fyUiPktRate = (uint32_t)((uint64_t)(pkt - fyUiPktPrev) * 1000UL / (dt ? dt : 1));
+    fyUiPktPrev = pkt;
+    fyUiRateAt = now;
+  }
+
+  // ---- left column ----
+  snprintf(buf, sizeof(buf), "%d", fyDetCount);
+  statsValue(ST_LVAL, ST_ROW0, ST_RLAB - ST_LVAL - 6, 4, TFT_WHITE, buf);
+
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)fyUiPktRate);
+  statsValue(ST_LVAL, ST_ROW0 + ST_ROWH, ST_RLAB - ST_LVAL - 6, 4, TFT_WHITE, buf);
+
+  // Alerts dropped: green when 0 (UI keeping up), red when >0 (UI starving RX).
+  uint32_t dropped = fyAlertsDropped;
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)dropped);
+  statsValue(ST_LVAL, ST_ROW0 + 2 * ST_ROWH, ST_RLAB - ST_LVAL - 6, 4,
+             dropped == 0 ? TFT_GREEN : TFT_RED, buf);
+
+  unsigned long s = now / 1000;
+  snprintf(buf, sizeof(buf), "%02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+  statsValue(ST_LVAL, ST_ROW0 + 3 * ST_ROWH, ST_RLAB - ST_LVAL - 6, 4, TFT_WHITE, buf);
+
+  // ---- right column ----
+  snprintf(buf, sizeof(buf), "%.2fV", readBatteryVolts());
+  statsValue(ST_RVAL, ST_ROW0, UI_W - ST_RVAL - 4, 4, TFT_WHITE, buf);
+
+  if (fyRssiMax == -128)
+  {
+    statsValue(ST_RVAL, ST_ROW0 + ST_ROWH, UI_W - ST_RVAL - 4, 4, TFT_DARKGREY, "--");
+    statsValue(ST_RVAL, ST_ROW0 + 2 * ST_ROWH, UI_W - ST_RVAL - 4, 4, TFT_DARKGREY, "--");
+    statsValue(ST_RVAL, ST_ROW0 + 3 * ST_ROWH, UI_W - ST_RVAL - 4, 4, TFT_DARKGREY, "--");
+  }
+  else
+  {
+    snprintf(buf, sizeof(buf), "%d", (int)fyRssiLast);
+    statsValue(ST_RVAL, ST_ROW0 + ST_ROWH, UI_W - ST_RVAL - 4, 4, TFT_WHITE, buf);
+    snprintf(buf, sizeof(buf), "%d", (int)fyRssiMax);
+    statsValue(ST_RVAL, ST_ROW0 + 2 * ST_ROWH, UI_W - ST_RVAL - 4, 4, TFT_GREEN, buf);
+    snprintf(buf, sizeof(buf), "%d", (int)fyRssiMin);
+    statsValue(ST_RVAL, ST_ROW0 + 3 * ST_ROWH, UI_W - ST_RVAL - 4, 4, TFT_ORANGE, buf);
+  }
+
+  // ---- full-width GPS + SD lines ----
+  tft.fillRect(0, ST_GPS_Y, UI_W, 20, TFT_BLACK);
+  tft.setTextFont(2);
   tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(4);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, BODY_TOP + 74);
-  tft.printf("Unique: %d", fyDetCount);
-  unsigned long s = millis() / 1000;
-  tft.setCursor(10, BODY_TOP + 104);
-  tft.printf("Uptime: %02lu:%02lu:%02lu", s / 3600, (s / 60) % 60, s % 60);
+  tft.setCursor(8, ST_GPS_Y);
+  if (gpsHasFix)
+  {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.printf("GPS: fix %usats  %.5f, %.5f", (unsigned)gpsSats, gpsLat, gpsLon);
+  }
+  else
+  {
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.print("GPS: no fix");
+  }
+
+  tft.fillRect(0, ST_SD_Y, UI_W, 20, TFT_BLACK);
+  tft.setCursor(8, ST_SD_Y);
+  if (sdReady)
+  {
+    const char *base = strrchr(fySessionPath, '/');
+    base = base ? base + 1 : fySessionPath;
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.printf("SD: OK  %s", base);
+  }
+  else
+  {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.print("SD: FAIL");
+  }
 }
 
 // ---- dispatch: full redraw, dynamic update, touch, tick ----------------
@@ -2118,6 +2275,10 @@ static void drawScreenFull()
     drawLiveStatic();
     break;
   case SCR_STATS:
+    // Prime the pkt/s sampler on entry so the first shown rate is a fresh
+    // ~1 s window rather than an average since boot.
+    fyUiRateAt = millis();
+    fyUiPktPrev = fyPktSeen;
     drawStatsStatic();
     break;
   }
@@ -2163,6 +2324,16 @@ static void handleTouch()
         screenDirty = true;
       }
     }
+    else if (currentScreen == SCR_STATS && statsBlankBtnHit(tx, ty))
+    {
+      // Blank the display + backlight for the RF-desense test. touchDown stays
+      // true (finger still down) so tftTick's blanked poll won't read this same
+      // press as the wake tap — the next fresh press edge wakes it.
+      uiBlanked = true;
+      pinMode(TFT_BL, OUTPUT);
+      digitalWrite(TFT_BL, LOW);
+      dualPrintln("[flockyou] display BLANKED (RF test) — tap to wake");
+    }
   }
   else if (!pressed)
   {
@@ -2189,9 +2360,29 @@ static void tftTick()
 {
   unsigned long now = millis();
 
-  // Display blanked for the RF-desense test ('b') — draw nothing.
+  // Display blanked for the RF-desense test (STATS "SCREEN OFF" button or 'b').
+  // Draw nothing, but KEEP polling touch so a tap wakes it — the driver has no
+  // PC/serial, so the screen must be recoverable by touch alone. Any fresh
+  // press edge un-blanks: backlight back on + full redraw.
   if (uiBlanked)
+  {
+    uint16_t tx, ty;
+    bool pressed = tft.getTouch(&tx, &ty);
+    if (pressed && !touchDown)
+    {
+      touchDown = true;
+      uiBlanked = false;
+      pinMode(TFT_BL, OUTPUT);
+      digitalWrite(TFT_BL, HIGH);
+      screenDirty = true;
+      dualPrintln("[flockyou] display woken by touch");
+    }
+    else if (!pressed)
+    {
+      touchDown = false;
+    }
     return;
+  }
 
   // Detection flash owns the whole screen for FLASH_HOLD_MS. Painted once, then
   // we restore the normal screen when it expires.
