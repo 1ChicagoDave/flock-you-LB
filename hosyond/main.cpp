@@ -123,10 +123,19 @@ static const size_t SSID_KEYWORD_COUNT = sizeof(target_ssid_keywords) / sizeof(t
 #define PROCESS_MGMT_FRAMES 1
 #define PROCESS_DATA_FRAMES 1
 
-// Persistence — session CSV on the SD card, latest file reloaded on boot so
-// counts survive power loss.
+// Persistence — a single append-only event log on the SD card, replayed on
+// boot to rebuild the live table so counts survive power loss.
 #define MAX_DETECTIONS 200
-#define AUTOSAVE_INTERVAL_MS 60000
+
+// ---- Append-only triangulation event log (/detections.csv) ----
+// Each detection EVENT stores WHERE the device was heard (lat/lon + rssi); many
+// events of one MAC from different positions let you triangulate the camera
+// offline. An event is appended only when we have a GPS fix AND either enough
+// time has passed since this MAC's last event OR we've moved far enough from it.
+#define EVENT_MIN_INTERVAL_MS 4000 // min ms between events for the same MAC
+#define EVENT_MIN_DISTANCE_M 20    // ...unless we've moved this many metres
+#define EVENT_FLUSH_MS 5000        // flush the open log at least this often
+#define EVENT_FLUSH_EVERY 16       // ...or after this many appends (first wins)
 
 // ---- Touchscreen UI (Phase 2a) ----
 // Landscape 480x320 layout. The status strip lives across the top, the active
@@ -269,12 +278,12 @@ static void IRAM_ATTR enqueueAlert(AlertType type, const uint8_t *mac, int8_t rs
 }
 
 // ============================================================
-// DETECTION TABLE  (on-device storage, persisted to SD CSV)
+// DETECTION TABLE  (in-RAM aggregate, rebuilt on boot from the SD event log)
 // ============================================================
 //
-// Single-threaded: only touched from loop() — drainAlertQueue() adds, and
-// fySaveSessionCSV() reads. No mutex needed. The WiFi-task callback never
-// touches this table; it only writes to the lock-free alert ring buffer.
+// Single-threaded: only touched from loop() — drainAlertQueue() adds/updates
+// and fyEventLogBegin() replay rebuilds it. No mutex needed. The WiFi-task
+// callback never touches this table; it only writes the lock-free alert ring.
 
 typedef struct
 {
@@ -282,21 +291,28 @@ typedef struct
   char method[16]; // "oui_addr2" / "oui_addr1" / "oui_addr3" / "ssid"
   int8_t rssi;
   uint8_t channel;
-  uint32_t firstSeen; // millis() at first hit
-  uint32_t lastSeen;  // millis() at latest hit
+  uint32_t firstSeen; // millis() at first hit (0 for replayed-from-log entries)
+  uint32_t lastSeen;  // millis() at latest hit (0 for replayed-from-log entries)
   uint16_t count;
-  char ssid[33];  // "" unless an SSID hit populated it
-  float lat;      // GPS latitude at first hit (0 if no fix)
-  float lon;      // GPS longitude at first hit (0 if no fix)
-  uint32_t utc;   // GPS UTC as unix epoch at first hit (0 if no fix)
-  uint8_t hasFix; // 1 if lat/lon/utc are valid
+  char ssid[33];    // "" unless an SSID hit populated it
+  float lat;        // GPS latitude at CLOSEST approach / strongest RSSI (0=no fix)
+  float lon;        // GPS longitude at CLOSEST approach / strongest RSSI (0=no fix)
+  uint32_t utc;     // GPS UTC epoch at that closest approach (0 if no fix)
+  uint8_t hasFix;   // 1 if lat/lon/utc are valid
+  int8_t bestRssi;  // strongest RSSI seen — gates the stored geotag above
+  // Per-MAC append throttle for the triangulation event log: last-logged event
+  // time (millis; 0 = none yet this power-on) and the position it was logged at.
+  uint32_t evtLastMs;
+  float evtLat;
+  float evtLon;
 } FYDetection;
 
 static FYDetection fyDet[MAX_DETECTIONS];
 static int fyDetCount = 0;
-static bool fyDirty = false;
-static unsigned long fyLastSaveAt = 0;
-static int fyLastSaveCount = 0;
+
+// Total detection EVENTS this power-on = replayed-from-log + appended-live. The
+// live device table (fyDetCount uniques) is rebuilt from these on boot.
+static uint32_t fyEventCount = 0;
 
 // ============================================================
 // STATE
@@ -342,8 +358,16 @@ static bool gpsHasFix = false;
 // SD / session-file state.
 static SPIClass sdSPI(VSPI);
 static bool sdReady = false;
-static int fySessionNum = 0;      // NNN of the file this power-on writes
-static char fySessionPath[24];    // "/session_NNN.csv"
+
+// Append-only event log — a single /detections.csv kept OPEN for the whole
+// session (opened once, appended per event, flushed on a cadence).
+static const char *kEventLogPath = "/detections.csv";
+static const char *kEventHeader =
+    "mac,method,rssi,channel,lat,lon,utc,sats,hdop,ssid";
+static File fyEventFile;
+static bool fyEventLogOpen = false;
+static uint32_t fyEventsSinceFlush = 0;
+static unsigned long fyLastFlushAt = 0;
 
 // Most-recent detection, for the TFT UI. These are the shared "last event"
 // fields the UI observes; drainAlertQueue() writes them on every emitted hit.
@@ -858,7 +882,14 @@ static int fyAddDetection(const char *mac, const char *method,
       {
         strlcpy(fyDet[i].ssid, ssid, sizeof(fyDet[i].ssid));
       }
-      fyDirty = true;
+      // Keep the stored geotag at the CLOSEST approach (strongest RSSI) so the
+      // 'd'/'j' table dump reflects the best single-point fix; the event log
+      // holds every position for real triangulation.
+      if (gpsHasFix && rssi > fyDet[i].bestRssi)
+      {
+        fyDet[i].bestRssi = rssi;
+        fyStampGps(fyDet[i]);
+      }
       if (outChirpWorthy)
         *outChirpWorthy = rediscover;
       return i;
@@ -874,6 +905,7 @@ static int fyAddDetection(const char *mac, const char *method,
   strlcpy(d.mac, mac, sizeof(d.mac));
   strlcpy(d.method, method ? method : "", sizeof(d.method));
   d.rssi = rssi;
+  d.bestRssi = rssi;
   d.channel = ch;
   d.firstSeen = now;
   d.lastSeen = now;
@@ -882,9 +914,11 @@ static int fyAddDetection(const char *mac, const char *method,
     strlcpy(d.ssid, ssid, sizeof(d.ssid));
   else
     d.ssid[0] = '\0';
-  fyStampGps(d); // geotag + timestamp the first sighting (no-op without a fix)
+  fyStampGps(d);   // geotag + timestamp the first sighting (no-op without a fix)
+  d.evtLastMs = 0; // no triangulation event logged for this MAC yet
+  d.evtLat = 0.0f;
+  d.evtLon = 0.0f;
   fyDetCount++;
-  fyDirty = true;
   if (outChirpWorthy)
     *outChirpWorthy = true;
   return fyDetCount - 1;
@@ -930,84 +964,111 @@ static size_t jsonEscape(char *dst, size_t cap, const char *src)
 }
 
 // ============================================================
-// SD SESSION PERSISTENCE  — CSV, latest file reloaded on boot
+// SD EVENT LOG  — append-only /detections.csv (triangulation source of truth)
 // ============================================================
 //
-// Each power-on writes a new /session_NNN.csv (zero-padded 3-digit). On boot we
-// scan / for the highest existing NNN, reload that file into the live table so
-// counts / firstSeen / GPS carry over, then open /session_(NNN+1).csv and seed
-// it from the carried-over table. The columns match the 'd' CSV export exactly:
-//   mac,method,rssi,channel,count,firstSeen_ms,lastSeen_ms,lat,lon,utc,hasFix,ssid
-// The ssid field is double-quoted.
+// One row per detection EVENT (not per unique device): each row stamps WHERE the
+// device was heard (lat/lon) + rssi, so multiple events of one MAC from
+// different positions let you triangulate the camera offline. This file is the
+// single source of truth — the old per-device whole-file rewrite is gone.
+//
+// The handle is kept OPEN for the whole session; rows are appended and the card
+// buffer is flushed every EVENT_FLUSH_MS or every EVENT_FLUSH_EVERY appends —
+// a flush is the costly SD op, so we batch it for power-loss safety without
+// paying it on every hit.
+//
+// Columns:  mac,method,rssi,channel,lat,lon,utc,sats,hdop,ssid   (ssid quoted)
+//
+// NOTE: boot replay is O(events) — a streaming, line-by-line read (never the
+// whole file into RAM), so boot time scales with log size (a few seconds for
+// thousands of events). Log rotation / compaction is a future guard and is
+// intentionally NOT implemented here.
 
-static const char *kSessionHeader =
-    "mac,method,rssi,channel,count,firstSeen_ms,lastSeen_ms,lat,lon,utc,hasFix,ssid";
-
-// Rewrite the current session file from the in-RAM table.
-static void fySaveSessionCSV()
+// Aggregate one replayed event into the live table: find-or-add the MAC, bump
+// its count, and keep the STRONGEST-rssi event's lat/lon/utc as the stored
+// position (closest approach). firstSeen/lastSeen stay 0 — they are millis()
+// (uptime) values with no meaning across a reboot, and are refreshed the moment
+// the device is next heard live.
+static void fyReplayEvent(const char *mac, const char *method, int8_t rssi,
+                          uint8_t ch, float lat, float lon, uint32_t utc,
+                          const char *ssid)
 {
-  if (!sdReady)
-    return;
-  if (!fyDirty && fyDetCount == fyLastSaveCount)
-    return;
+  fyEventCount++;
 
-  File f = SD.open(fySessionPath, FILE_WRITE); // "w" — truncates and rewrites
-  if (!f)
-  {
-    dualPrintf("[flockyou] save failed: cannot open %s\n", fySessionPath);
-    return;
-  }
-  f.println(kSessionHeader);
+  int idx = -1;
   for (int i = 0; i < fyDetCount; i++)
   {
-    FYDetection &d = fyDet[i];
-    f.printf("%s,%s,%d,%u,%u,%lu,%lu,%.6f,%.6f,%lu,%u,\"%s\"\n",
-             d.mac, d.method, d.rssi, (unsigned)d.channel, (unsigned)d.count,
-             (unsigned long)d.firstSeen, (unsigned long)d.lastSeen,
-             d.lat, d.lon, (unsigned long)d.utc, (unsigned)d.hasFix, d.ssid);
+    if (strcasecmp(fyDet[i].mac, mac) == 0)
+    {
+      idx = i;
+      break;
+    }
   }
-  f.close();
 
-  fyLastSaveAt = millis();
-  fyLastSaveCount = fyDetCount;
-  fyDirty = false;
+  if (idx < 0)
+  {
+    if (fyDetCount >= MAX_DETECTIONS)
+      return; // table full — event still counted, just not aggregated
+    FYDetection &d = fyDet[fyDetCount];
+    memset(&d, 0, sizeof(d));
+    strlcpy(d.mac, mac, sizeof(d.mac));
+    strlcpy(d.method, method, sizeof(d.method));
+    d.rssi = rssi;
+    d.bestRssi = rssi;
+    d.channel = ch;
+    d.count = 1;
+    d.lat = lat;
+    d.lon = lon;
+    d.utc = utc;
+    d.hasFix = 1; // events are only ever logged with a fix
+    if (ssid && ssid[0])
+      strlcpy(d.ssid, ssid, sizeof(d.ssid));
+    // Seed the append-throttle so the first LIVE hit logs immediately (evtLastMs
+    // == 0), from a sane last-known position.
+    d.evtLastMs = 0;
+    d.evtLat = lat;
+    d.evtLon = lon;
+    fyDetCount++;
+    return;
+  }
+
+  FYDetection &d = fyDet[idx];
+  if (d.count < 0xFFFF)
+    d.count++;
+  d.rssi = rssi; // last replayed rssi
+  d.channel = ch;
+  if (rssi > d.bestRssi) // stronger = closer approach → keep this position
+  {
+    d.bestRssi = rssi;
+    d.lat = lat;
+    d.lon = lon;
+    d.utc = utc;
+  }
+  if (ssid && ssid[0] && !d.ssid[0])
+    strlcpy(d.ssid, ssid, sizeof(d.ssid));
+  d.evtLat = lat;
+  d.evtLon = lon;
 }
 
-// Parse one saved CSV row back into the live table.
-static void fyParseSessionRow(char *line)
+// Parse one event-log CSV line and feed it to the aggregator.
+static void fyReplayLine(char *line)
 {
-  if (fyDetCount >= MAX_DETECTIONS)
-    return;
-
   char mac[18] = {0};
   char method[16] = {0};
-  int rssi = 0, ch = 0, cnt = 0, hasFix = 0;
-  unsigned long firstSeen = 0, lastSeen = 0, utc = 0;
-  float lat = 0.0f, lon = 0.0f;
+  int rssi = 0, ch = 0, sats = 0;
+  unsigned long utc = 0;
+  float lat = 0.0f, lon = 0.0f, hdop = 0.0f;
   int consumed = 0;
 
   int got = sscanf(line,
-                   "%17[^,],%15[^,],%d,%d,%d,%lu,%lu,%f,%f,%lu,%d,%n",
-                   mac, method, &rssi, &ch, &cnt, &firstSeen, &lastSeen,
-                   &lat, &lon, &utc, &hasFix, &consumed);
-  if (got < 11)
+                   "%17[^,],%15[^,],%d,%d,%f,%f,%lu,%d,%f,%n",
+                   mac, method, &rssi, &ch, &lat, &lon, &utc, &sats, &hdop,
+                   &consumed);
+  if (got < 9)
     return;
 
-  FYDetection &d = fyDet[fyDetCount];
-  memset(&d, 0, sizeof(d));
-  strlcpy(d.mac, mac, sizeof(d.mac));
-  strlcpy(d.method, method, sizeof(d.method));
-  d.rssi = (int8_t)rssi;
-  d.channel = (uint8_t)ch;
-  d.count = (uint16_t)cnt;
-  d.firstSeen = (uint32_t)firstSeen;
-  d.lastSeen = (uint32_t)lastSeen;
-  d.utc = (uint32_t)utc;
-  d.lat = lat;
-  d.lon = lon;
-  d.hasFix = (uint8_t)hasFix;
-
-  // ssid is the double-quoted remainder after the 11th comma.
+  // ssid is the double-quoted remainder after the 9th comma.
+  char ssid[33] = {0};
   const char *s = line + consumed;
   if (*s == '"')
     s++;
@@ -1016,90 +1077,110 @@ static void fyParseSessionRow(char *line)
     sl--;
   if (sl > 0 && s[sl - 1] == '"')
     sl--;
-  size_t n = (sl < sizeof(d.ssid) - 1) ? sl : sizeof(d.ssid) - 1;
-  memcpy(d.ssid, s, n);
-  d.ssid[n] = '\0';
+  size_t n = (sl < sizeof(ssid) - 1) ? sl : sizeof(ssid) - 1;
+  memcpy(ssid, s, n);
+  ssid[n] = '\0';
 
-  fyDetCount++;
+  fyReplayEvent(mac, method, (int8_t)rssi, (uint8_t)ch, lat, lon,
+                (uint32_t)utc, ssid);
 }
 
-// Load a saved session CSV into the live table.
-static void fyLoadSessionCSV(int num)
+// Append one event row for MAC `d` at the current GPS fix, updating the per-MAC
+// throttle state and the flush cadence. Called from drainAlertQueue (loop/core
+// 1), never the sniffer callback.
+static void fyAppendEvent(FYDetection &d, const char *method, int8_t rssi,
+                          uint8_t ch, const char *ssid)
 {
-  char path[24];
-  snprintf(path, sizeof(path), "/session_%03d.csv", num);
-  File f = SD.open(path, FILE_READ);
-  if (!f)
-    return;
+  d.evtLastMs = millis();
+  d.evtLat = (float)gpsLat;
+  d.evtLon = (float)gpsLon;
+  fyEventCount++;
 
-  bool header = true;
-  char line[256];
-  while (f.available())
+  if (!fyEventLogOpen)
+    return; // no SD — counted for the UI, just not persisted
+
+  fyEventFile.printf("%s,%s,%d,%u,%.6f,%.6f,%lu,%u,%.2f,\"%s\"\n",
+                     d.mac, method, rssi, (unsigned)ch, gpsLat, gpsLon,
+                     (unsigned long)gpsUtc, (unsigned)gpsSats, gpsHdop,
+                     ssid ? ssid : "");
+
+  if (++fyEventsSinceFlush >= EVENT_FLUSH_EVERY)
   {
-    size_t len = f.readBytesUntil('\n', line, sizeof(line) - 1);
-    line[len] = '\0';
-    if (len == 0)
-      continue;
-    if (header)
-    {
-      header = false; // skip the column header row
-      continue;
-    }
-    fyParseSessionRow(line);
-    if (fyDetCount >= MAX_DETECTIONS)
-      break;
+    fyEventFile.flush();
+    fyEventsSinceFlush = 0;
+    fyLastFlushAt = millis();
   }
-  f.close();
 }
 
-// Scan / for the highest existing session_NNN.csv. Returns NNN, or -1 if none.
-static int fyScanHighestSession()
-{
-  int highest = -1;
-  File root = SD.open("/");
-  if (!root)
-    return -1;
-  for (File entry = root.openNextFile(); entry; entry = root.openNextFile())
-  {
-    const char *name = entry.name();
-    const char *base = strrchr(name, '/');
-    base = base ? base + 1 : name;
-    int n = -1;
-    if (sscanf(base, "session_%d.csv", &n) == 1 && n > highest)
-      highest = n;
-    entry.close();
-  }
-  root.close();
-  return highest;
-}
-
-// Boot: reload the newest session (carry the table over), then open a fresh
-// file for this power-on and seed it from the carried-over table.
-static void fySessionBegin()
+// Boot: replay /detections.csv into the live table (streaming), then leave the
+// log open in append mode (seeked to end) for this power-on. Missing file →
+// create it with the header and start fresh. SD absent → run without logging.
+static void fyEventLogBegin()
 {
   if (!sdReady)
   {
-    dualPrintln("[flockyou] SD not mounted — running without logging");
+    dualPrintln("[flockyou] SD not mounted — running without event logging");
     return;
   }
-  int highest = fyScanHighestSession();
-  if (highest >= 0)
+
+  if (SD.exists(kEventLogPath))
   {
-    fyLoadSessionCSV(highest);
-    dualPrintf("[flockyou] restored %d detections from /session_%03d.csv\n",
-               fyDetCount, highest);
+    File f = SD.open(kEventLogPath, FILE_READ);
+    if (f)
+    {
+      bool header = true;
+      char line[192];
+      while (f.available())
+      {
+        size_t len = f.readBytesUntil('\n', line, sizeof(line) - 1);
+        line[len] = '\0';
+        if (len == 0)
+          continue;
+        if (header)
+        {
+          header = false; // skip the column header row
+          continue;
+        }
+        fyReplayLine(line);
+      }
+      f.close();
+    }
+    dualPrintf("[flockyou] replayed %lu events, %d unique devices\n",
+               (unsigned long)fyEventCount, fyDetCount);
   }
   else
   {
-    dualPrintln("[flockyou] no prior session — starting fresh");
+    File f = SD.open(kEventLogPath, FILE_WRITE); // create + write header once
+    if (f)
+    {
+      f.println(kEventHeader);
+      f.close();
+    }
+    dualPrintf("[flockyou] no prior log — created %s\n", kEventLogPath);
   }
-  fyLastSaveCount = fyDetCount;
 
-  fySessionNum = highest + 1;
-  snprintf(fySessionPath, sizeof(fySessionPath), "/session_%03d.csv", fySessionNum);
-  fyDirty = true;         // force the initial seed write
-  fySaveSessionCSV();     // create + seed the new file from the carried table
-  dualPrintf("[flockyou] logging to %s\n", fySessionPath);
+  // Open for appending (FILE_APPEND == "a", seeks to end) and hold it open.
+  fyEventFile = SD.open(kEventLogPath, FILE_APPEND);
+  fyEventLogOpen = (bool)fyEventFile;
+  fyLastFlushAt = millis();
+  if (fyEventLogOpen)
+    dualPrintf("[flockyou] appending events to %s\n", kEventLogPath);
+  else
+    dualPrintln("[flockyou] WARNING: could not open event log for append");
+}
+
+// Periodic flush of the open log — the only recurring SD write now that there
+// is no whole-file rewrite. Flushes at most every EVENT_FLUSH_MS, and only when
+// there is something new since the last flush.
+static void fyEventFlushTick()
+{
+  if (!fyEventLogOpen || fyEventsSinceFlush == 0)
+    return;
+  if (millis() - fyLastFlushAt < EVENT_FLUSH_MS)
+    return;
+  fyEventFile.flush();
+  fyEventsSinceFlush = 0;
+  fyLastFlushAt = millis();
 }
 
 // ============================================================
@@ -1403,6 +1484,29 @@ static void drainAlertQueue()
     fyLastEventAt = millis();
     fyHaveLast = true;
 
+    // ---- Triangulation event log (append-only) --------------------------
+    // Only fixes are useful for triangulation, so no-fix hits update the table
+    // + UI above but are never logged. Append this MAC's position if it's been
+    // >= EVENT_MIN_INTERVAL_MS since its last event OR we've physically moved
+    // >= EVENT_MIN_DISTANCE_M from where we last logged it (cheap equirect approx).
+    if (gpsHasFix && idx >= 0)
+    {
+      FYDetection &d = fyDet[idx];
+      bool due = (d.evtLastMs == 0) ||
+                 (millis() - d.evtLastMs >= EVENT_MIN_INTERVAL_MS);
+      bool moved = false;
+      if (d.evtLastMs != 0)
+      {
+        double dLat = (gpsLat - d.evtLat) * 111320.0;
+        double dLon = (gpsLon - d.evtLon) * 111320.0 * cos(d.evtLat * PI / 180.0);
+        double dist = sqrt(dLat * dLat + dLon * dLon);
+        moved = dist >= EVENT_MIN_DISTANCE_M;
+      }
+      if (due || moved)
+        fyAppendEvent(d, method, e.rssi, e.channel,
+                      (e.type == ALERT_SSID) ? e.ssid : "");
+    }
+
     // Human-readable line (for serial terminal).
     char oui[9];
     ouiFromMac(e.mac, oui, sizeof(oui));
@@ -1462,19 +1566,6 @@ static void drainAlertQueue()
       stopSniffing("SSID hit");
 #endif
   }
-}
-
-// ============================================================
-// AUTOSAVE
-// ============================================================
-
-static void autosaveTick()
-{
-  if (!sdReady || !fyDirty)
-    return;
-  if (millis() - fyLastSaveAt < AUTOSAVE_INTERVAL_MS)
-    return;
-  fySaveSessionCSV();
 }
 
 // Heartbeat beep while at least one target was seen in the last
@@ -2128,7 +2219,7 @@ static void drawStatsStatic()
 
   // Left-column labels.
   tft.setCursor(8, ST_ROW0 + 6);
-  tft.print("Devices");
+  tft.print("Unique");
   tft.setCursor(8, ST_ROW0 + ST_ROWH + 6);
   tft.print("Pkt/s");
   tft.setCursor(8, ST_ROW0 + 2 * ST_ROWH + 6);
@@ -2136,9 +2227,10 @@ static void drawStatsStatic()
   tft.setCursor(8, ST_ROW0 + 3 * ST_ROWH + 6);
   tft.print("Uptime");
 
-  // Right-column labels.
+  // Right-column labels. (Vbat lives in the top status strip; this slot shows
+  // total detection EVENTS logged — the triangulation sample count.)
   tft.setCursor(ST_RLAB, ST_ROW0 + 6);
-  tft.print("Vbat");
+  tft.print("Detections");
   tft.setCursor(ST_RLAB, ST_ROW0 + ST_ROWH + 6);
   tft.print("RSSI last");
   tft.setCursor(ST_RLAB, ST_ROW0 + 2 * ST_ROWH + 6);
@@ -2203,7 +2295,9 @@ static void updateStats()
   statsValue(ST_LVAL, ST_ROW0 + 3 * ST_ROWH, ST_RLAB - ST_LVAL - 6, 4, TFT_WHITE, buf);
 
   // ---- right column ----
-  snprintf(buf, sizeof(buf), "%.2fV", readBatteryVolts());
+  // Detections = total events logged this power-on (replayed + appended). Shown
+  // alongside "Unique" (fyDetCount) so the operator sees both counts at a glance.
+  snprintf(buf, sizeof(buf), "%lu", (unsigned long)fyEventCount);
   statsValue(ST_RVAL, ST_ROW0, UI_W - ST_RVAL - 4, 4, TFT_WHITE, buf);
 
   if (fyRssiMax == -128)
@@ -2242,10 +2336,10 @@ static void updateStats()
   tft.setCursor(8, ST_SD_Y);
   if (sdReady)
   {
-    const char *base = strrchr(fySessionPath, '/');
-    base = base ? base + 1 : fySessionPath;
+    const char *base = strrchr(kEventLogPath, '/');
+    base = base ? base + 1 : kEventLogPath;
     tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.printf("SD: OK  %s", base);
+    tft.printf("SD: %s  %s", fyEventLogOpen ? "OK" : "RO", base);
   }
   else
   {
@@ -2490,9 +2584,9 @@ void setup()
   precompileOuis();
   memset(dedupeTable, 0, sizeof(dedupeTable));
 
-  // SD card + session persistence. Non-fatal if the card is missing.
+  // SD card + append-only event log. Non-fatal if the card is missing.
   sdBegin();
-  fySessionBegin();
+  fyEventLogBegin();
 
   WiFi.mode(WIFI_MODE_NULL);
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
@@ -2523,7 +2617,6 @@ void setup()
              RSSI_MIN, sdReady ? 1 : 0);
 
   lastHeartbeat = millis();
-  fyLastSaveAt = millis();
   screenDirty = true; // draw the first UI frame immediately
 }
 
@@ -2553,8 +2646,8 @@ void loop()
   gpsTick();           // feed NMEA + refresh fix before detections are stamped
   serialCommandTick(); // 'd'/'j'/'k'/'b' over USB serial
   updateChannelMode();
-  drainAlertQueue();   // Serial.printf happens here, not in callback
-  autosaveTick();      // periodic SD CSV write if dirty
+  drainAlertQueue();   // Serial.printf + event-log append happen here, not in callback
+  fyEventFlushTick();  // periodic flush of the open append-only event log
   heartbeatTick();     // audible beep-pair while a target is still in range
   ledTick();           // turn off LED after LED_FLASH_MS
   breatheTick();       // subtle idle "still alive" blink between detections
