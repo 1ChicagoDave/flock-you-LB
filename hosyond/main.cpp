@@ -20,6 +20,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include "esp_wifi.h"
+#include "esp_sleep.h" // deep-sleep + ext0 touch-wake (SLEEP mode)
 #include <ctype.h>
 #include <string.h>
 #include <SPI.h>
@@ -405,6 +406,7 @@ static Preferences uiPrefs;
 // the UI framework lives further down.
 static bool screenDirty = true;
 static void touchCalibrate(bool force);
+static void enterSleep(); // manual deep-sleep entry (defined in the UI section)
 
 // ============================================================
 // 802.11 HEADER
@@ -1641,6 +1643,10 @@ static void serialCommandTick()
       touchCalibrate(true); // force re-run the corner-arrow calibration
       screenDirty = true;   // full redraw once calibration finishes
     }
+    else if (c == 'z' || c == 'Z')
+    {
+      enterSleep(); // manual deep sleep — never returns (wake = full reset)
+    }
     else if (c == 'b' || c == 'B')
     {
       // RF-desense test: blank the display + backlight. If detection improves
@@ -2121,61 +2127,418 @@ static void updateHunter()
   }
 }
 
-// ---- SCR_ALERT / SCR_LIVE / SCR_STATS (2b/2c placeholders) -------------
+// ---- shared UI helpers for ALERT + LIVE --------------------------------
+
+// Human "X{s,m,h} ago" from an elapsed-millis span.
+static void fmtAgo(char *buf, size_t n, unsigned long ms)
+{
+  unsigned long s = ms / 1000;
+  if (s < 60)
+    snprintf(buf, n, "%lus ago", s);
+  else if (s < 3600)
+    snprintf(buf, n, "%lum ago", s / 60);
+  else
+    snprintf(buf, n, "%luh ago", s / 3600);
+}
+
+// Compact class tag for the tight LIVE list column (alertTypeLabel is too wide).
+static const char *alertTypeShort(AlertType t)
+{
+  switch (t)
+  {
+  case ALERT_WILDCARD_PROBE:
+    return "PROBE";
+  case ALERT_OUI_ADDR2:
+    return "OUI-TX";
+  case ALERT_OUI_ADDR1:
+    return "OUI-RX";
+  case ALERT_OUI_ADDR3:
+    return "BSSID";
+  case ALERT_SSID:
+    return "SSID";
+  default:
+    return "?";
+  }
+}
+
+static int fyFindByMac(const char *mac)
+{
+  for (int i = 0; i < fyDetCount; i++)
+    if (strcmp(fyDet[i].mac, mac) == 0)
+      return i;
+  return -1;
+}
+
+// Most-recent-first index order into fyDet[] (by lastSeen ms). Rebuilt each
+// slow tick; the LIVE list + row hit-test and the ALERT recent list read it.
+static int liveOrder[MAX_DETECTIONS];
+static int liveShown = 0; // device rows currently drawn on the LIVE list
+
+static void buildLiveOrder()
+{
+  for (int i = 0; i < fyDetCount; i++)
+    liveOrder[i] = i;
+  // Insertion sort, descending lastSeen. n <= MAX_DETECTIONS (200) — cheap at 1 Hz.
+  for (int i = 1; i < fyDetCount; i++)
+  {
+    int key = liveOrder[i];
+    uint32_t k = fyDet[key].lastSeen;
+    int j = i - 1;
+    while (j >= 0 && fyDet[liveOrder[j]].lastSeen < k)
+    {
+      liveOrder[j + 1] = liveOrder[j];
+      j--;
+    }
+    liveOrder[j + 1] = key;
+  }
+}
+
+// ---- SCR_ALERT: big glanceable readout of the most recent detection -----
+//
+// Complements the momentary full-screen flash with a persistent, always-visible
+// summary of the last hit. Big fields (MAC/method) repaint only on identity
+// change; the RSSI cell repaints on value change; the "ago"/GPS/recent lines
+// refresh every ~1 Hz slow tick so the age timer counts up smoothly.
+
+static char alertCacheMac[18] = "";
+static AlertType alertCacheType = ALERT_OUI_ADDR2;
+static int8_t alertCacheRssi = 127;
+static bool alertCacheHad = false;
+static bool alertForce = false;
 
 static void drawAlertStatic()
 {
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(4);
-  tft.setTextColor(TFT_RED, TFT_BLACK);
-  tft.setCursor(10, BODY_TOP + 10);
-  tft.print("ALERTS");
-  tft.setTextFont(2);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.setCursor(10, BODY_TOP + 44);
-  tft.print("(2b) live alert feed lands here");
+  // Body already cleared by drawScreenFull — just arm a full repaint.
+  alertCacheMac[0] = '\0';
+  alertCacheRssi = 127;
+  alertCacheHad = false;
+  alertForce = true;
 }
 
 static void updateAlert()
 {
-  tft.fillRect(0, BODY_TOP + 70, UI_W, 40, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(2);
-  tft.setCursor(10, BODY_TOP + 74);
-  if (fyHaveLast)
+  unsigned long now = millis();
+
+  if (!fyHaveLast)
   {
-    tft.setTextColor(alertTftColor(fyLastType), TFT_BLACK);
-    tft.printf("Last: %s  %s  %ddBm", fyLastMac, alertTypeLabel(fyLastType),
-               (int)fyLastRssi);
+    if (alertForce || alertCacheHad)
+    {
+      tft.fillRect(0, BODY_TOP, UI_W, BODY_BOT - BODY_TOP, TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextFont(4);
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.drawString("NO DETECTIONS YET", UI_W / 2, BODY_TOP + 70);
+      tft.setTextDatum(TL_DATUM);
+      alertForce = false;
+      alertCacheHad = false;
+    }
+    // scanning line — refresh each tick as channels hop.
+    tft.fillRect(0, BODY_TOP + 110, UI_W, 40, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(4);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    char b[32];
+    snprintf(b, sizeof(b), "scanning ch %u", currentChannel);
+    tft.drawString(b, UI_W / 2, BODY_TOP + 128);
+    tft.setTextDatum(TL_DATUM);
+    return;
+  }
+
+  AlertType t = fyLastType;
+
+  // MAC + method label — repaint only when the identity changes (no flicker).
+  bool identityChanged = alertForce || !alertCacheHad ||
+                         strcmp(fyLastMac, alertCacheMac) != 0 ||
+                         t != alertCacheType;
+  if (identityChanged)
+  {
+    tft.fillRect(0, BODY_TOP + 4, UI_W, 62, TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(4);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString(fyLastMac, UI_W / 2, BODY_TOP + 18);
+    tft.setTextColor(alertTftColor(t), TFT_BLACK);
+    tft.drawString(alertTypeLabel(t), UI_W / 2, BODY_TOP + 48);
+    tft.setTextDatum(TL_DATUM);
+    strlcpy(alertCacheMac, fyLastMac, sizeof(alertCacheMac));
+    alertCacheType = t;
+    alertForce = false;
+    alertCacheRssi = 127; // force the RSSI cell to repaint below
+  }
+  alertCacheHad = true;
+
+  // Big RSSI dBm — repaint only when the value changes.
+  if (fyLastRssi != alertCacheRssi)
+  {
+    tft.fillRect(0, BODY_TOP + 68, UI_W, 56, TFT_BLACK);
+    char rb[8];
+    snprintf(rb, sizeof(rb), "%d", (int)fyLastRssi);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextFont(6);
+    tft.setTextColor(gaugeColor565(rssiToPct(fyLastRssi)), TFT_BLACK);
+    tft.drawString(rb, UI_W / 2 - 24, BODY_TOP + 94);
+    tft.setTextFont(4);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString("dBm", UI_W / 2 + 56, BODY_TOP + 100);
+    tft.setTextDatum(TL_DATUM);
+    alertCacheRssi = fyLastRssi;
+  }
+
+  // Meta line: "Xs ago   ch N" — refresh each tick.
+  int li = fyFindByMac(fyLastMac);
+  unsigned lastCh = (li >= 0) ? fyDet[li].channel : currentChannel;
+  char ago[16], meta[40];
+  fmtAgo(ago, sizeof(ago), now - fyLastEventAt);
+  snprintf(meta, sizeof(meta), "%s    ch %u", ago, lastCh);
+  tft.fillRect(0, BODY_TOP + 126, UI_W, 26, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(meta, UI_W / 2, BODY_TOP + 139);
+  tft.setTextDatum(TL_DATUM);
+
+  // GPS line.
+  tft.fillRect(0, BODY_TOP + 156, UI_W, 20, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setCursor(8, BODY_TOP + 156);
+  if (gpsHasFix)
+  {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.printf("GPS: fix  %.5f, %.5f", gpsLat, gpsLon);
   }
   else
   {
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.print("no active alert");
+    tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+    tft.print("GPS: no fix");
+  }
+
+  // Recent-2 list (the next two most-recent devices after the headline MAC).
+  buildLiveOrder();
+  tft.fillRect(0, BODY_TOP + 180, UI_W, 70, TFT_BLACK);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(8, BODY_TOP + 180);
+  tft.print("recent:");
+  int line = 0;
+  for (int i = 0; i < fyDetCount && line < 2; i++)
+  {
+    int di = liveOrder[i];
+    if (strcmp(fyDet[di].mac, fyLastMac) == 0)
+      continue;
+    AlertType tt = methodToAlertType(fyDet[di].method);
+    tft.setTextColor(alertTftColor(tt), TFT_BLACK);
+    tft.setCursor(70, BODY_TOP + 200 + line * 20);
+    tft.printf("%s  %ddBm  x%u", fyDet[di].mac, (int)fyDet[di].rssi,
+               (unsigned)fyDet[di].count);
+    line++;
+  }
+}
+
+// ---- SCR_LIVE: scrolling device list + tap-through DETAIL overlay -------
+//
+// List sorted most-recent-first (buildLiveOrder). Tapping a row opens a static
+// DETAIL overlay for that device; any tap (or the BACK button) closes it. The
+// list repaints per-row on the ~1 Hz slow path (flicker-free cell clears); the
+// detail's "ago" timers tick, the rest is static.
+
+#define LV_HDR_Y (BODY_TOP + 2)     // column-header row
+#define LV_LIST_TOP (BODY_TOP + 22) // first data row
+#define LV_ROWH 25
+#define LV_MAX_ROWS 9               // (TABBAR_Y - LV_LIST_TOP) / LV_ROWH
+#define LV_X_MAC 6
+#define LV_X_TYPE 168
+#define LV_X_RSSI 300
+#define LV_X_CNT 400
+
+// DETAIL overlay: BACK button + the tick-updated "seen" lines.
+#define LV_BACK_X 384
+#define LV_BACK_Y (BODY_TOP + 2)
+#define LV_BACK_W 92
+#define LV_BACK_H 32
+#define LV_D_SEEN_Y (BODY_TOP + 200)
+
+static bool liveDetailOpen = false;
+static int liveDetailIdx = -1; // fyDet[] index shown in the detail overlay
+
+static inline bool liveBackBtnHit(uint16_t tx, uint16_t ty)
+{
+  return tx >= LV_BACK_X && tx < (LV_BACK_X + LV_BACK_W) &&
+         ty >= LV_BACK_Y && ty < (LV_BACK_Y + LV_BACK_H);
+}
+
+static void drawLiveDetailStatic()
+{
+  tft.setTextDatum(TL_DATUM);
+
+  // BACK button (top-right of the body).
+  tft.fillRoundRect(LV_BACK_X, LV_BACK_Y, LV_BACK_W, LV_BACK_H, 5, TFT_NAVY);
+  tft.drawRoundRect(LV_BACK_X, LV_BACK_Y, LV_BACK_W, LV_BACK_H, 5, TFT_CYAN);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, TFT_NAVY);
+  tft.drawString("BACK", LV_BACK_X + LV_BACK_W / 2, LV_BACK_Y + LV_BACK_H / 2);
+  tft.setTextDatum(TL_DATUM);
+
+  if (liveDetailIdx < 0 || liveDetailIdx >= fyDetCount)
+    return;
+  FYDetection &d = fyDet[liveDetailIdx];
+  AlertType t = methodToAlertType(d.method);
+
+  tft.setTextFont(4);
+  tft.setTextColor(alertTftColor(t), TFT_BLACK);
+  tft.setCursor(8, BODY_TOP + 6);
+  tft.print(d.mac);
+
+  tft.setTextFont(2);
+  tft.setTextColor(alertTftColor(t), TFT_BLACK);
+  tft.setCursor(8, BODY_TOP + 40);
+  tft.print(alertTypeLabel(t));
+
+  int y = BODY_TOP + 64;
+  const int lh = 22;
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(8, y);
+  tft.printf("Channel: %u", (unsigned)d.channel);
+  y += lh;
+  tft.setCursor(8, y);
+  tft.printf("Count: %u", (unsigned)d.count);
+  y += lh;
+  tft.setCursor(8, y);
+  tft.printf("RSSI last: %d dBm    best: %d dBm", (int)d.rssi, (int)d.bestRssi);
+  y += lh;
+  tft.setCursor(8, y);
+  if (d.hasFix)
+    tft.printf("GPS: %.5f, %.5f", d.lat, d.lon);
+  else
+    tft.print("GPS: no geotag");
+  y += lh;
+  if (d.ssid[0])
+  {
+    tft.setCursor(8, y);
+    tft.printf("SSID: %s", d.ssid);
+  }
+}
+
+static void updateLiveDetail()
+{
+  if (liveDetailIdx < 0 || liveDetailIdx >= fyDetCount)
+    return;
+  FYDetection &d = fyDet[liveDetailIdx];
+  unsigned long now = millis();
+  char buf[24];
+
+  tft.setTextFont(2);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  tft.fillRect(0, LV_D_SEEN_Y, UI_W, 20, TFT_BLACK);
+  tft.setCursor(8, LV_D_SEEN_Y);
+  if (d.firstSeen == 0)
+    tft.print("First seen: (replayed from log)");
+  else
+  {
+    fmtAgo(buf, sizeof(buf), now - d.firstSeen);
+    tft.printf("First seen: %s", buf);
+  }
+
+  tft.fillRect(0, LV_D_SEEN_Y + 22, UI_W, 20, TFT_BLACK);
+  tft.setCursor(8, LV_D_SEEN_Y + 22);
+  if (d.lastSeen == 0)
+    tft.print("Last seen: (not this boot)");
+  else
+  {
+    fmtAgo(buf, sizeof(buf), now - d.lastSeen);
+    tft.printf("Last seen: %s", buf);
   }
 }
 
 static void drawLiveStatic()
 {
+  if (liveDetailOpen)
+  {
+    drawLiveDetailStatic();
+    return;
+  }
   tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(4);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.setCursor(10, BODY_TOP + 10);
-  tft.print("LIVE");
   tft.setTextFont(2);
   tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.setCursor(10, BODY_TOP + 44);
-  tft.print("(2c) scrolling detection list lands here");
+  tft.setCursor(LV_X_MAC, LV_HDR_Y);
+  tft.print("DEVICE");
+  tft.setCursor(LV_X_TYPE, LV_HDR_Y);
+  tft.print("TYPE");
+  tft.setCursor(LV_X_RSSI, LV_HDR_Y);
+  tft.print("RSSI");
+  tft.setCursor(LV_X_CNT, LV_HDR_Y);
+  tft.print("CNT");
+  tft.drawFastHLine(0, LV_LIST_TOP - 2, UI_W, TFT_DARKGREY);
 }
 
 static void updateLive()
 {
-  tft.fillRect(0, BODY_TOP + 70, UI_W, 40, TFT_BLACK);
+  if (liveDetailOpen)
+  {
+    updateLiveDetail();
+    return;
+  }
+
+  buildLiveOrder();
+
+  bool hasMore = (fyDetCount > LV_MAX_ROWS);
+  int shown = hasMore ? (LV_MAX_ROWS - 1) : fyDetCount; // reserve a "+M more" row
+  liveShown = shown;
+
   tft.setTextDatum(TL_DATUM);
-  tft.setTextFont(4);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setCursor(10, BODY_TOP + 74);
-  tft.printf("%d detections", fyDetCount);
+  tft.setTextFont(2);
+  for (int r = 0; r < LV_MAX_ROWS; r++)
+  {
+    int y = LV_LIST_TOP + r * LV_ROWH;
+    tft.fillRect(0, y, UI_W, LV_ROWH, TFT_BLACK);
+    if (r < shown)
+    {
+      FYDetection &d = fyDet[liveOrder[r]];
+      AlertType t = methodToAlertType(d.method);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(LV_X_MAC, y + 5);
+      tft.print(d.mac);
+      tft.setTextColor(alertTftColor(t), TFT_BLACK);
+      tft.setCursor(LV_X_TYPE, y + 5);
+      tft.print(alertTypeShort(t));
+      tft.setTextColor(gaugeColor565(rssiToPct(d.rssi)), TFT_BLACK);
+      tft.setCursor(LV_X_RSSI, y + 5);
+      tft.printf("%d", (int)d.rssi);
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setCursor(LV_X_CNT, y + 5);
+      tft.printf("%u", (unsigned)d.count);
+    }
+    else if (hasMore && r == shown)
+    {
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.setCursor(LV_X_MAC, y + 5);
+      tft.printf("+%d more", fyDetCount - shown);
+    }
+  }
+}
+
+// Press-edge handler for the LIVE body: open a row's detail, or close it.
+static void handleLiveTouch(uint16_t tx, uint16_t ty)
+{
+  if (liveDetailOpen)
+  {
+    liveDetailOpen = false; // any body tap (incl. BACK) returns to the list
+    screenDirty = true;
+    return;
+  }
+  if (ty < LV_LIST_TOP)
+    return; // header strip — ignore
+  int row = (ty - LV_LIST_TOP) / LV_ROWH;
+  if (row >= 0 && row < liveShown)
+  {
+    liveDetailIdx = liveOrder[row];
+    liveDetailOpen = true;
+    screenDirty = true;
+  }
 }
 
 // ---- STATS: on-screen diagnostics dashboard ----------------------------
@@ -2200,10 +2563,23 @@ static void updateLive()
 #define ST_BTN_W 172
 #define ST_BTN_H 50
 
+// SLEEP button (deep sleep, max battery savings) — bottom-left, mirrors the
+// SCREEN OFF button. Both live in the free strip below the GPS/SD lines.
+#define ST_SLP_X 8
+#define ST_SLP_Y 220
+#define ST_SLP_W 172
+#define ST_SLP_H 50
+
 static inline bool statsBlankBtnHit(uint16_t tx, uint16_t ty)
 {
   return tx >= ST_BTN_X && tx < (ST_BTN_X + ST_BTN_W) &&
          ty >= ST_BTN_Y && ty < (ST_BTN_Y + ST_BTN_H);
+}
+
+static inline bool statsSleepBtnHit(uint16_t tx, uint16_t ty)
+{
+  return tx >= ST_SLP_X && tx < (ST_SLP_X + ST_SLP_W) &&
+         ty >= ST_SLP_Y && ty < (ST_SLP_Y + ST_SLP_H);
 }
 
 // On-screen packet-rate sampler (~1 Hz), independent of the 5 s serial diagTick.
@@ -2248,6 +2624,17 @@ static void drawStatsStatic()
   tft.setTextFont(2);
   tft.setTextColor(TFT_CYAN, TFT_NAVY);
   tft.drawString("tap to wake / RF test", ST_BTN_X + ST_BTN_W / 2, ST_BTN_Y + 38);
+
+  // SLEEP button (static — appearance never changes).
+  tft.fillRoundRect(ST_SLP_X, ST_SLP_Y, ST_SLP_W, ST_SLP_H, 6, TFT_MAROON);
+  tft.drawRoundRect(ST_SLP_X, ST_SLP_Y, ST_SLP_W, ST_SLP_H, 6, TFT_RED);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_WHITE, TFT_MAROON);
+  tft.drawString("SLEEP", ST_SLP_X + ST_SLP_W / 2, ST_SLP_Y + 18);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_ORANGE, TFT_MAROON);
+  tft.drawString("deep sleep / tap to wake", ST_SLP_X + ST_SLP_W / 2, ST_SLP_Y + 38);
   tft.setTextDatum(TL_DATUM);
 }
 
@@ -2348,6 +2735,73 @@ static void updateStats()
   }
 }
 
+// ---- SLEEP: manual max-savings deep sleep (no new wiring) ---------------
+//
+// Triggered by the STATS "SLEEP" button or the serial 'z' command. Deep sleep
+// resets the chip, so we FLUSH+CLOSE the event log first (the file handle is
+// dropped on reset — unflushed rows would be lost), park the GPS in standby,
+// kill the backlight (~142 mA, the biggest single drain), and arm wake on the
+// XPT2046 PENIRQ (GPIO36, idles high / goes LOW on touch — already wired, no
+// new hardware). Wake = a full reboot (~few seconds): setup() re-mounts SD,
+// replays /detections.csv to restore the table, and reloads touch cal from NVS.
+static void enterSleep()
+{
+  dualPrintln("[flockyou] entering deep sleep — tap screen to wake");
+
+  // 1. Brief full-screen notice.
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextFont(4);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString("SLEEPING", UI_W / 2, UI_H / 2 - 18);
+  tft.setTextFont(2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("tap screen to wake", UI_W / 2, UI_H / 2 + 20);
+  tft.setTextDatum(TL_DATUM);
+
+  // 2. Flush + close the event log (deep sleep drops the handle — REQUIRED).
+  if (fyEventLogOpen)
+  {
+    fyEventFile.flush();
+    fyEventFile.close();
+    fyEventLogOpen = false;
+  }
+
+  // 3. GPS into low-power standby (wakes on any serial byte later).
+  Serial2.println("$PMTK161,0*28");
+  Serial2.flush();
+
+  // Wait for the finger to actually lift before arming the touch-wake. ext0
+  // wakes on LOW (PENIRQ held down), so sleeping with a finger still on the
+  // SLEEP button would wake instantly → reboot loop. Poll the touch controller
+  // until it's been released for 150 ms straight; give up after 5 s and sleep
+  // anyway (a genuinely stuck panel would just re-wake, no worse than before).
+  {
+    uint16_t tx, ty;
+    unsigned long releasedSince = millis();
+    unsigned long cap = millis() + 5000;
+    while (millis() < cap)
+    {
+      if (tft.getTouch(&tx, &ty))
+        releasedSince = millis(); // still held — keep waiting
+      else if (millis() - releasedSince >= 150)
+        break; // clean release
+      delay(10);
+    }
+  }
+
+  // 4. Backlight off — the single biggest current drain.
+  pinMode(TFT_BL, OUTPUT);
+  digitalWrite(TFT_BL, LOW);
+
+  // 5. Wake on a screen touch via the XPT2046 PENIRQ on GPIO36 (idles high,
+  //    goes LOW on touch). No new wiring.
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_36, 0);
+
+  // 6. Sleep. This never returns — wake is a full reset back into setup().
+  esp_deep_sleep_start();
+}
+
 // ---- dispatch: full redraw, dynamic update, touch, tick ----------------
 
 static void drawScreenFull()
@@ -2415,6 +2869,7 @@ static void handleTouch()
       if ((int)currentScreen != idx)
       {
         currentScreen = (UiScreen)idx;
+        liveDetailOpen = false; // leaving LIVE closes any open detail overlay
         screenDirty = true;
       }
     }
@@ -2427,6 +2882,14 @@ static void handleTouch()
       pinMode(TFT_BL, OUTPUT);
       digitalWrite(TFT_BL, LOW);
       dualPrintln("[flockyou] display BLANKED (RF test) — tap to wake");
+    }
+    else if (currentScreen == SCR_STATS && statsSleepBtnHit(tx, ty))
+    {
+      enterSleep(); // never returns — wake is a full reset
+    }
+    else if (currentScreen == SCR_LIVE)
+    {
+      handleLiveTouch(tx, ty);
     }
   }
   else if (!pressed)
@@ -2554,6 +3017,10 @@ void setup()
   Serial.begin(115200);
   delay(300);
 
+  // Deep-sleep wake is just a normal reset; note whether we woke from our own
+  // SLEEP mode (ext0 touch on GPIO36) so we can nudge the GPS out of standby.
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+
   // RGB LED (common anode: HIGH = off) — start dark.
   pinMode(PIN_LED_R, OUTPUT);
   pinMode(PIN_LED_G, OUTPUT);
@@ -2566,6 +3033,14 @@ void setup()
 
   // GPS on UART2 (RX=25, TX=32).
   gpsBegin();
+
+  // If we woke from SLEEP mode, the GPS is in PMTK161 standby — any serial byte
+  // wakes it. (touchCalibrate(false) below reloads cal from NVS; no recal.)
+  if (wakeCause == ESP_SLEEP_WAKEUP_EXT0)
+  {
+    Serial2.println(""); // nudge the GPS out of standby
+    dualPrintln("[flockyou] woke from sleep (touch)");
+  }
 
   // Display first, so status is visible during the rest of bring-up.
   tftInit();
