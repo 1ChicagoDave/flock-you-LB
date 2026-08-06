@@ -48,7 +48,11 @@
 #define PIN_SD_MOSI 23
 
 #define PIN_AUDIO_DAC 26 // ESP32 DAC2 -> SC8002B AUDIO_IN
-#define PIN_AUDIO_EN 4   // SC8002B enable (drive HIGH to un-mute the amp)
+#define PIN_AUDIO_EN 4 // SC8002B enable. The board's pin table says LOW=enable,
+                       // high=disable (a pull-up leaves audio OFF by default), so
+                       // we drive LOW to un-mute. Flip if the 'a' test proves it.
+#define AUDIO_EN_ON LOW
+#define AUDIO_EN_OFF HIGH
 
 #define PIN_BAT_ADC 34 // battery voltage via 100K/100K divider (x2), input-only
 
@@ -1647,6 +1651,20 @@ static void serialCommandTick()
     {
       enterSleep(); // manual deep sleep — never returns (wake = full reset)
     }
+    else if (c == 'a' || c == 'A')
+    {
+      // Audio bench test: play a tone at BOTH enable polarities so we can hear
+      // which one un-mutes the amp. Report back which beep you heard.
+      dualPrintln("[flockyou] audio test: beep A = EN LOW ...");
+      digitalWrite(PIN_AUDIO_EN, LOW);
+      beep(2200, 400);
+      delay(400);
+      dualPrintln("[flockyou] audio test: beep B = EN HIGH ...");
+      digitalWrite(PIN_AUDIO_EN, HIGH);
+      beep(2200, 400);
+      digitalWrite(PIN_AUDIO_EN, AUDIO_EN_ON); // restore configured default
+      dualPrintln("[flockyou] audio test done — which beep did you hear, A or B?");
+    }
     else if (c == 'b' || c == 'B')
     {
       // RF-desense test: blank the display + backlight. If detection improves
@@ -3027,9 +3045,9 @@ void setup()
   pinMode(PIN_LED_B, OUTPUT);
   rgbOff();
 
-  // Audio amp enable (SC8002B: HIGH un-mutes).
+  // Audio amp enable (SC8002B). Board pin table: LOW un-mutes.
   pinMode(PIN_AUDIO_EN, OUTPUT);
-  digitalWrite(PIN_AUDIO_EN, HIGH);
+  digitalWrite(PIN_AUDIO_EN, AUDIO_EN_ON);
 
   // GPS on UART2 (RX=25, TX=32).
   gpsBegin();
