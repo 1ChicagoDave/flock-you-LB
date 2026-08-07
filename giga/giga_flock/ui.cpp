@@ -121,13 +121,13 @@ static lv_obj_t *makeStatRow(lv_obj_t *parent, const char *title)
   lv_label_set_text(t, title);
   lv_obj_set_width(t, 190);
   lv_obj_set_style_text_color(t, hx(COL_DIM), 0);
-  lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
 
   lv_obj_t *v = lv_label_create(row);
   lv_label_set_recolor(v, true);
   lv_label_set_text(v, "-");
   lv_obj_set_style_text_color(v, hx(COL_TEXT), 0);
-  lv_obj_set_style_text_font(v, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(v, &lv_font_montserrat_14, 0);
   return v;
 }
 
@@ -172,27 +172,27 @@ static void buildAlert()
 
   alMethod = lv_label_create(col);
   lv_label_set_text(alMethod, "— no detections —");
-  lv_obj_set_style_text_font(alMethod, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_font(alMethod, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(alMethod, hx(COL_DIM), 0);
 
   alRssi = lv_label_create(col);
   lv_label_set_text(alRssi, "--");
-  lv_obj_set_style_text_font(alRssi, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_font(alRssi, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(alRssi, hx(COL_TEXT), 0);
 
   alMac = lv_label_create(col);
   lv_label_set_text(alMac, "--:--:--:--:--:--");
-  lv_obj_set_style_text_font(alMac, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_font(alMac, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(alMac, hx(COL_TEXT), 0);
 
   alAge = lv_label_create(col);
   lv_label_set_text(alAge, "");
-  lv_obj_set_style_text_font(alAge, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(alAge, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(alAge, hx(COL_DIM), 0);
 
   alChGps = lv_label_create(col);
   lv_label_set_text(alChGps, "");
-  lv_obj_set_style_text_font(alChGps, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(alChGps, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(alChGps, hx(COL_DIM), 0);
 }
 
@@ -208,17 +208,17 @@ static void buildHunter()
 
   lv_obj_t *title = lv_label_create(col);
   lv_label_set_text(title, "STRONGEST TARGET");
-  lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(title, hx(COL_DIM), 0);
 
   hnMac = lv_label_create(col);
   lv_label_set_text(hnMac, "— none —");
-  lv_obj_set_style_text_font(hnMac, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_font(hnMac, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(hnMac, hx(COL_TEXT), 0);
 
   hnRssiLbl = lv_label_create(col);
   lv_label_set_text(hnRssiLbl, "-- dBm");
-  lv_obj_set_style_text_font(hnRssiLbl, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_font(hnRssiLbl, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(hnRssiLbl, hx(COL_TEXT), 0);
 
   hnBar = lv_bar_create(col);
@@ -281,7 +281,7 @@ static void rebuildLiveList(uint32_t now)
     lv_obj_t *lbl = lv_label_create(liveList);
     lv_label_set_recolor(lbl, true);
     lv_obj_set_width(lbl, LV_PCT(100));
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(lbl, hx(COL_TEXT), 0);
     // MAC in default color, method token recolored to its class color.
     // Pre-format with the C library snprintf (LVGL's mini-printf is unreliable
@@ -299,7 +299,7 @@ static void rebuildLiveList(uint32_t now)
     lv_obj_t *lbl = lv_label_create(liveList);
     lv_label_set_text(lbl, "waiting for detections...");
     lv_obj_set_style_text_color(lbl, hx(COL_DIM), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
   }
   lastLiveRebuild = now;
 }

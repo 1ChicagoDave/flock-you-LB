@@ -1,13 +1,15 @@
 // ============================================================
-// storage.h — QSPI flash CSV event log
+// storage.h — internal QSPI flash CSV event log
 // ============================================================
 #pragma once
 
 #include <Arduino.h>
 
-// Mounts the 16 MB QSPI flash (FAT) and opens the append-only event log.
-// Returns true on success.  On failure the firmware runs WITHOUT logging
-// (never hangs) — see storage.cpp for the one-time-format note.
+// Mounts the internal 16 MB QSPI flash's FAT user-data partition (MBR
+// partition 2) via the mbed FATFileSystem API and opens the append-only event
+// log at /fs/detections.csv.  Returns true on success.  If the partition is not
+// present/formatted (one-time QSPIFormat example — see storage.cpp) the
+// firmware runs WITHOUT logging and never hangs.
 bool storage_init();
 
 // Append one detection EVENT row.  Columns (exactly):

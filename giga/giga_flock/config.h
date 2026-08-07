@@ -47,7 +47,7 @@
 // append-only event log for later triangulation.
 #define EVENT_MIN_DISTANCE_M   20.0     // metres (equirectangular approximation)
 #define EVENT_MIN_INTERVAL_MS  60000UL  // keepalive interval
-#define LOG_PATH               "/qspi/detections.csv"  // QSPI FAT mount root is /qspi
+#define LOG_PATH               "/fs/detections.csv"  // mbed FATFileSystem mount root is /fs
 #define LOG_HEADER             "mac,method,rssi,channel,lat,lon,utc,sats,hdop,ssid"
 
 // ---- Detection-class colors (0xRRGGBB) --------------------------------------

@@ -1,29 +1,39 @@
 // ============================================================
-// storage.cpp — QSPI flash CSV event log (Arduino_POSIXStorage)
+// storage.cpp — internal QSPI flash CSV event log (mbed FATFileSystem)
 // ============================================================
 //
-// We use Arduino's official Arduino_POSIXStorage library: it mounts the GIGA's
-// 16 MB QSPI flash and exposes plain POSIX stdio (fopen/fprintf/fflush).  The
-// QSPI FAT partition mounts at "/qspi", so our file lives at /qspi/detections.csv
-// (see LOG_PATH in config.h).
+// The GIGA R1 has 16 MB of internal QSPI NOR flash.  Arduino_POSIXStorage can
+// NOT reach it — that library only exposes DEV_SDCARD and DEV_USB, there is no
+// DEV_QSPI.  So we talk to the flash directly through the mbed block-device /
+// filesystem API that ships inside the mbed_giga core.
+//
+// The QSPI is partitioned (MBR) into two areas: partition 1 holds the Wi-Fi /
+// BLE firmware blob used by the onboard module, and partition 2 is a FAT
+// user-data area.  We mount partition 2 read/write and keep our CSV there, at
+// /fs/detections.csv (see LOG_PATH in config.h).
 //
 // *** ONE-TIME FORMAT ***
-// A brand-new GIGA (or one whose QSPI holds a non-FAT filesystem) will FAIL to
-// mount until the QSPI is formatted FAT once.  Do it with the Arduino example
-// sketch:  File > Examples > STM32H747_System > QSPIFormat  (choose the option
-// that creates a FAT partition for user data).  After that this code mounts
-// cleanly on every boot.  If the mount fails we simply run without logging —
-// the detector, UI, audio and GPS all keep working; only the CSV is skipped.
-//
-// KNOWN-UNCERTAIN: the exact POSIXStorage enum names (DEV_QSPI / FS_FAT /
-// MNT_DEFAULT) and the "/qspi" mount root are per the current library; verify
-// against your installed Arduino_POSIXStorage version if mount() won't compile.
+// The user-data FAT partition is created ONCE by the official Arduino example
+// sketch:  File > Examples > STM32H747_System > QSPIFormat  (pick the option
+// that keeps the Wi-Fi firmware and adds a FAT user-data partition).  Until that
+// is done fs.mount() returns non-zero; we then run WITHOUT logging — the
+// detector, UI, audio and GPS all keep working, only the CSV is skipped.  We
+// DELIBERATELY never reformat/mkfs here: doing so could wipe the Wi-Fi firmware
+// partition.
 
 #include "storage.h"
 #include "config.h"
 
-#include <Arduino_POSIXStorage.h>
+#include "BlockDevice.h"
+#include "MBRBlockDevice.h"
+#include "FATFileSystem.h"
+
 #include <stdio.h>
+
+// Internal QSPI flash + its FAT user-data partition (MBR partition 2).
+static mbed::BlockDevice   *s_root = nullptr;
+static mbed::MBRBlockDevice *s_userbd = nullptr;
+static mbed::FATFileSystem  s_fs("fs");     // mounts under "/fs"
 
 static FILE *s_log   = nullptr;
 static bool  s_ready = false;
@@ -35,11 +45,24 @@ bool storage_init()
   s_ready = false;
   s_log   = nullptr;
 
-  // mount() returns 0 on success, non-zero (with errno set) on failure.
-  int err = mount(DEV_QSPI, FS_FAT, MNT_DEFAULT);
+  // Default block device on the GIGA is the 16 MB QSPI NOR flash.
+  s_root = mbed::BlockDevice::get_default_instance();
+  if (!s_root) return false;
+  if (s_root->init() != 0) return false;
+
+  // Partition 2 = the FAT user-data partition (partition 1 = Wi-Fi firmware).
+  static mbed::MBRBlockDevice userbd(s_root, 2);
+  s_userbd = &userbd;
+  if (s_userbd->init() != 0)
+  {
+    // No MBR / partition 2 present — QSPI not formatted for user data yet.
+    return false;
+  }
+
+  // Mount the existing FAT.  Non-zero => not formatted; run without logging.
+  int err = s_fs.mount(s_userbd);
   if (err != 0)
   {
-    // Almost always "not formatted" — run without logging (see header note).
     return false;
   }
 
@@ -54,7 +77,7 @@ bool storage_init()
   s_log = fopen(LOG_PATH, "a");
   if (!s_log)
   {
-    umount(DEV_QSPI);
+    s_fs.unmount();
     return false;
   }
 
