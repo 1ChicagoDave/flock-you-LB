@@ -12,48 +12,60 @@
 // table for the screen PLUS an append-only event log for later triangulation.
 //
 // ----------------------------------------------------------------------------
-// ARDUINO LIBRARIES TO INSTALL (Library Manager unless noted):
-//   * Arduino_H7_Video           — GIGA Display Shield driver + LVGL glue
-//   * lvgl                        — **install 8.3.x** (this code targets LVGL v8;
-//                                   see ui.cpp KNOWN-UNCERTAIN for the v9 deltas)
+// BOARD PACKAGE: "Arduino Mbed OS GIGA Boards"  (FQBN arduino:mbed_giga:giga)
+//
+// DISPLAY DRIVER — DO NOT "FIX" THIS INCLUDE:
+//   The display driver on this core is Arduino_H7_Video, and it is BUNDLED WITH
+//   THE CORE — it is NOT a Library Manager library.  It lives at
+//     <arduino15>/packages/arduino/hardware/mbed_giga/<ver>/libraries/Arduino_H7_Video
+//   and its header is "Arduino_H7_Video.h".
+//
+//   There IS a Library Manager library called "Arduino_Video" whose header is
+//   "Arduino_Video.h".  It is NOT for this board: its library.properties says
+//   architectures=zephyr_main, i.e. it only applies to the Arduino *Zephyr*
+//   core, and it targets LVGL v9 through a different API.  Because the arch tag
+//   does not match mbed_giga, arduino-cli silently EXCLUDES it from the build,
+//   so #include "Arduino_Video.h" fails with a bare "No such file or directory"
+//   even though the folder is plainly sitting in your libraries directory.
+//   That mismatch is what broke this sketch. Keep the include below as-is.
+//
+// LIBRARY MANAGER LIBRARIES TO INSTALL:
+//   * lvgl                        — v9.x (this code targets v9; see ui.cpp)
 //   * Arduino_GigaDisplayTouch    — GT911 capacitive touch
 //   * Arduino_GigaDisplay         — onboard RGB LED (GigaDisplayRGB)
 //   * TinyGPSPlus                 — NMEA parsing (Serial2)
-//   * ArduinoJson                 — UART line parsing (this code uses v7 API)
-//   * Arduino_POSIXStorage        — QSPI flash mount + POSIX file I/O
-//   Board package: "Arduino Mbed OS GIGA Boards" (select Arduino GIGA R1).
+//   * ArduinoJson                 — UART line parsing (this code uses the v7 API)
+//   (No Arduino_POSIXStorage — see storage.cpp; it cannot reach the QSPI.)
 //
-// lv_conf.h NOTE:
-//   LVGL needs an lv_conf.h.  Copy <libraries>/lvgl/lv_conf_template.h to
-//   <libraries>/lv_conf.h, set  #if 1  at the top to enable it, and set:
-//       LV_COLOR_DEPTH        16          // GIGA panel is RGB565
-//       LV_FONT_MONTSERRAT_14 1
-//       LV_FONT_MONTSERRAT_20 1
-//       LV_FONT_MONTSERRAT_28 1
-//       LV_FONT_MONTSERRAT_48 1           // big ALERT/HUNTER readouts
-//   (Arduino_H7_Video expects LVGL's default draw path; leave LV_USE_GPU/DMA off
-//    unless you know your version supports it.)  If you rely on the library's
-//    bundled default lv_conf, make sure those fonts are enabled there instead.
+// lv_conf.h NOTE — the copy in this folder is INERT:
+//   Arduino_H7_Video ships its own lv_conf.h in its src/ directory, which
+//   auto-selects lv_conf_8.h or lv_conf_9.h by probing for a v9-only header.
+//   That is the config the build actually uses; it sets LV_COLOR_DEPTH 16 and
+//   enables LV_FONT_MONTSERRAT_14, which is all this UI needs.  The lv_conf.h
+//   sitting next to this sketch is NOT picked up (verified with a #warning
+//   probe: zero hits).  Edit the core's copy if you need to change LVGL config
+//   — editing the local one will appear to do nothing.
 //
 // ----------------------------------------------------------------------------
-// !!! KNOWN-UNCERTAIN — verify when you first compile/flash (details in files):
-//   1. LVGL v8 vs v9 API (ui.cpp): tabview create signature + indev registration
-//      differ.  Pin lvgl 8.3.x to match this code, or apply the "V9:" edits.
-//   2. QSPI filesystem (storage.cpp): Arduino_POSIXStorage enum names
-//      (DEV_QSPI/FS_FAT/MNT_DEFAULT) and the "/qspi" mount root; QSPI must be
-//      FAT-formatted ONCE via the QSPIFormat example or mount() fails (handled
-//      gracefully — runs without logging).
-//   3. DAC tone (audio.cpp): analogWrite(A12) assumes A12 routes to the DAC on
-//      your core version; mbed AnalogOut fallback is provided.
-//   4. GT911 touch (ui.cpp): getTouchPoints()/GDTpoint_t names + the portrait->
-//      landscape coordinate remap (TOUCH_SWAP_XY / TOUCH_INV_*).
+// !!! KNOWN-UNCERTAIN — these are RUNTIME behaviours a clean compile cannot
+// prove.  The sketch builds; these still want eyes on first flash:
+//   1. QSPI filesystem (storage.cpp): the QSPI must be FAT-formatted ONCE via
+//      File > Examples > STM32H747_System > QSPIFormat (pick the option that
+//      KEEPS the Wi-Fi firmware partition).  Until then mount() returns non-zero
+//      and we run without logging — handled gracefully, UI still works.
+//   2. DAC tone (audio.cpp): analogWrite(A12) assumes A12 routes to the DAC on
+//      your core version; an mbed AnalogOut fallback is provided.
+//   3. GT911 touch (ui.cpp): the portrait->landscape coordinate remap
+//      (TOUCH_SWAP_XY / TOUCH_INV_*) may need flipping for your panel.
 // ----------------------------------------------------------------------------
 
+#if __has_include(<Arduino.h>)
 #include <Arduino.h>
+#endif
 #include <ArduinoJson.h>
 #include <TinyGPSPlus.h>
 
-#include "Arduino_H7_Video.h"
+#include "Arduino_H7_Video.h"   // core-bundled. NOT "Arduino_Video.h" — see above.
 #include "Arduino_GigaDisplayTouch.h"
 #include "Arduino_GigaDisplay.h"        // GigaDisplayRGB (onboard LED)
 #include "lvgl.h"

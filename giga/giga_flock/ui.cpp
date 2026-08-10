@@ -11,15 +11,20 @@
 //
 // We register the GT911 touch as an LVGL pointer input device here.
 //
-// KNOWN-UNCERTAIN (verify at compile time):
-//  * LVGL MAJOR VERSION.  This file targets **LVGL v8** (install lvgl 8.3.x from
-//    the Library Manager — the version the GIGA guide/Arduino_H7_Video expect).
-//    Under v9 several calls change: lv_indev_drv_* -> lv_indev_create();
-//    lv_tabview_create(parent, dir, size) -> lv_tabview_create(parent) +
-//    lv_tabview_set_tab_bar_size(); LV_PART/LV_STATE names are stable.  Search
-//    the "V9:" comments below for the spots to touch.
-//  * FONTS.  The big readouts use montserrat_20/28/48.  Enable them in your
-//    lv_conf.h (LV_FONT_MONTSERRAT_20/28/48 = 1) or the build won't link them.
+// LVGL MAJOR VERSION: this file targets **LVGL v9** (verified against lvgl
+// 9.5.0).  It was originally written for v8; the v8->v9 deltas that mattered
+// here were exactly three:
+//   1. lv_indev_drv_t / lv_indev_drv_init / lv_indev_drv_register  ->
+//      lv_indev_create() + lv_indev_set_type() + lv_indev_set_read_cb().
+//   2. The read callback's first arg is lv_indev_t*, not lv_indev_drv_t*.
+//   3. lv_tabview_create(parent, dir, size) -> lv_tabview_create(parent)
+//      followed by lv_tabview_set_tab_bar_size(tv, size).
+// LV_PART/LV_STATE names, the flex API, and lv_label_set_recolor are unchanged.
+//
+// FONTS: this file only uses lv_font_montserrat_14.  That font is enabled by
+// the lv_conf the core supplies (see the lv_conf note in giga_flock.ino).  If
+// you switch any readout to montserrat_20/28/48 you must enable those there
+// first, or the build will fail at link time with an undefined reference.
 //  * TOUCH ORIENTATION.  GT911 native frame is portrait (480x800).  The remap in
 //    touch_read_cb() converts to our 800x480 landscape; flip TOUCH_* below if
 //    taps land rotated/mirrored on your unit.
@@ -62,7 +67,7 @@ static lv_obj_t *hnMac, *hnRssiLbl, *hnBar;
 static lv_color_t hx(uint32_t rgb) { return lv_color_hex(rgb); }
 
 // GT911 point struct name in Arduino_GigaDisplayTouch is GDTpoint_t.
-static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
+static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
 {
   (void)drv;
   GDTpoint_t pts[5];
@@ -97,12 +102,10 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 
 static void register_touch()
 {
-  // V9: replace with lv_indev_create()/lv_indev_set_read_cb().
-  static lv_indev_drv_t indev_drv;
-  lv_indev_drv_init(&indev_drv);
-  indev_drv.type    = LV_INDEV_TYPE_POINTER;
-  indev_drv.read_cb = touch_read_cb;
-  lv_indev_drv_register(&indev_drv);
+  // LVGL v9 input-device registration (see the v8->v9 note at the top).
+  lv_indev_t *indev = lv_indev_create();
+  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(indev, touch_read_cb);
 }
 
 // A titled value label pair packed into a parent; returns the value label.
@@ -234,8 +237,9 @@ void ui_init()
   // Global dark background on the active screen.
   lv_obj_set_style_bg_color(lv_scr_act(), hx(COL_BG), 0);
 
-  // V9: lv_tabview_create(parent); then lv_tabview_set_tab_bar_size(tv, H);
-  tabview = lv_tabview_create(lv_scr_act(), LV_DIR_TOP, TABBAR_H);
+  // LVGL v9: create, then size the tab bar as a separate call.
+  tabview = lv_tabview_create(lv_scr_act());
+  lv_tabview_set_tab_bar_size(tabview, TABBAR_H);
   lv_obj_set_style_bg_color(tabview, hx(COL_BG), 0);
 
   tabLive   = lv_tabview_add_tab(tabview, "LIVE");
