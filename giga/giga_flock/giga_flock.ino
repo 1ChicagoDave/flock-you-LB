@@ -340,8 +340,8 @@ static void pollGps()
 void setup()
 {
   Serial.begin(115200);           // USB debug only
-  ESP32_SERIAL.begin(ESP32_BAUD); // Serial1: D18=TX, D19=RX
-  GPS_SERIAL.begin(GPS_BAUD);     // Serial2: D16=TX, D17=RX
+  ESP32_SERIAL.begin(ESP32_BAUD); // Serial4: D14=TX, D15=RX (D18/D19 don't work here)
+  GPS_SERIAL.begin(GPS_BAUD);     // Serial3: D16=TX, D17=RX (GPS)
 
   audio_init();
   rgbLed.begin();

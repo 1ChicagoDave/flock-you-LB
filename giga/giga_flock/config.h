@@ -7,14 +7,16 @@
 #include <Arduino.h>
 
 // ---- Serial links -----------------------------------------------------------
-// ESP32 radio link on Serial1 (GIGA D18=TX, D19=RX).  ESP32 TX -> GIGA D19,
-// ESP32 RX <- GIGA D18, common GND.  Newline-delimited JSON @115200 (see
-// esp32_companion/companion.cpp for the exact wire format we parse).
-#define ESP32_SERIAL   Serial1
+// ESP32 radio link on Serial4 (GIGA D14=TX, D15=RX per the variant). ESP32 TX
+// (GPIO17) -> GIGA D15, ESP32 RX (GPIO16) <- GIGA D14, common GND. Newline JSON
+// @115200 (see esp32_companion/companion.cpp).
+// NOTE: D18/D19 (Serial2) do NOT carry the link on this unit (display shield /
+// bad pins) despite a good signal both ends — hardware-verified. Use Serial4.
+#define ESP32_SERIAL   Serial4
 #define ESP32_BAUD     115200
 
-// GPS on Serial2 (GIGA D16=TX, D17=RX).  Adafruit Ultimate GPS, 9600 NMEA.
-#define GPS_SERIAL     Serial2
+// GPS on Serial3 (GIGA D16=TX, D17=RX ARE Serial3 per the variant). 9600 NMEA.
+#define GPS_SERIAL     Serial3
 #define GPS_BAUD       9600
 #define GPS_STALE_MS   3000     // a fix older than this is treated as "no fix"
 
