@@ -39,12 +39,15 @@
 // The touch object is created in the .ino; we just reference it.
 extern Arduino_GigaDisplayTouch TouchDetector;
 
-// ---- touch coordinate remap (portrait GT911 -> landscape screen) ----
-// Start here; adjust if taps are off.  For a panel physically rotated 90°:
-//   screen_x = touch_y ; screen_y = (PANEL_W-1) - touch_x
-#define TOUCH_SWAP_XY   1
+// ---- touch coordinate remap ----
+// On this unit the GT911 already reports landscape-aligned coords (x:0..799
+// right, y:0..479 down), so the mapping is identity.  The earlier swap+invert
+// rotated every gesture 90° (horizontal swipes scrolled, vertical swipes changed
+// tabs).  If a single axis ends up MIRRORED (taps land, but left/right or
+// up/down is reversed), flip just that INV_* bit — do NOT re-enable the swap.
+#define TOUCH_SWAP_XY   0
 #define TOUCH_INV_X     0
-#define TOUCH_INV_Y     1
+#define TOUCH_INV_Y     0
 #define PANEL_NATIVE_W  480      // GT911 native width (portrait)
 #define PANEL_NATIVE_H  800      // GT911 native height (portrait)
 
