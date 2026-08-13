@@ -35,7 +35,6 @@
 
 #include "lvgl.h"
 #include "Arduino_GigaDisplayTouch.h"
-#include <math.h>
 
 // The touch object is created in the .ino; we just reference it.
 extern Arduino_GigaDisplayTouch TouchDetector;
@@ -54,26 +53,7 @@ extern Arduino_GigaDisplayTouch TouchDetector;
 
 // ---- widget handles ----
 static lv_obj_t *tabview;
-static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter, *tabRadar;
-
-// ---- RADAR scope geometry + state ----
-#define RADAR_TAB_IDX 4        // LIVE0 STATS1 ALERT2 HUNTER3 RADAR4
-#define RADAR_D   400          // scope diameter (px)
-#define RCX       (RADAR_D / 2)
-#define RCY       (RADAR_D / 2)
-#define RMAX      (RADAR_D / 2 - 6)   // outer ring radius
-#define RADAR_NB  28           // max simultaneous blips on the scope
-#define NTRAIL    2            // sweep beam + fading trail segments
-#define BLIP      12           // blip diameter (px)
-#define DEG2RAD   0.0174532925f
-
-static lv_obj_t          *scope;
-static lv_obj_t          *beamLine[NTRAIL];
-static lv_point_precise_t beamPts[NTRAIL][2];
-static lv_obj_t          *blip[RADAR_NB];
-static uint8_t            devBright[MAX_DEVICES];   // per-device blip glow (0..255)
-static int                sweepDeg     = 0;
-static uint32_t           lastRadarMs  = 0;
+static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter;
 
 static lv_obj_t *liveList;              // flex container of row labels
 static uint32_t  lastLiveRebuild = 0;
@@ -102,15 +82,6 @@ static uint32_t dimColor(uint32_t rgb, uint8_t pct)
   uint32_t g = ((rgb >> 8)  & 0xFF) * pct / 100;
   uint32_t b = ( rgb        & 0xFF) * pct / 100;
   return (r << 16) | (g << 8) | b;
-}
-
-// Stable pseudo-bearing (0..359) for a MAC, so each device keeps a fixed spot on
-// the radar (we have no real bearing without a directional antenna).
-static int macAngle(const char *mac)
-{
-  uint32_t h = 2166136261u;              // FNV-1a
-  for (const char *p = mac; *p; p++) { h ^= (uint8_t)*p; h *= 16777619u; }
-  return (int)(h % 360);
 }
 
 // Tap anywhere on the flash overlay to dismiss it early.
@@ -332,93 +303,6 @@ static void buildAlertOverlay()
   lv_obj_set_style_text_color(asSub, hx(0xF0F0F0), 0);
 }
 
-// Sonar-style radar scope: concentric range rings, a rotating sweep beam with a
-// fading trail, and a blip per active device (angle = stable MAC hash, radius =
-// signal strength, color = detection class).  Blips glow as the beam passes.
-static void buildRadar()
-{
-  lv_obj_t *page = lv_obj_create(tabRadar);
-  lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
-  lv_obj_set_style_bg_color(page, hx(COL_BG), 0);
-  lv_obj_set_style_border_width(page, 0, 0);
-  lv_obj_set_style_pad_all(page, 0, 0);
-  lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(page, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-
-  // NOTE: every child below gets lv_obj_remove_style_all() first — strips the
-  // default theme (borders, padding, scroll, and importantly the style
-  // TRANSITIONS that would otherwise spawn an animation on every per-frame
-  // color/opacity change and exhaust the LVGL heap in a few seconds).
-  scope = lv_obj_create(page);
-  lv_obj_remove_style_all(scope);
-  lv_obj_set_size(scope, RADAR_D, RADAR_D);
-  lv_obj_set_style_radius(scope, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(scope, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(scope, hx(0x04160C), 0);   // very dark green
-  lv_obj_clear_flag(scope, LV_OBJ_FLAG_SCROLLABLE);
-
-  // Range rings (border-only circles): outer, 2/3, 1/3.
-  const int rings[] = { RMAX, RMAX * 2 / 3, RMAX / 3 };
-  for (int k = 0; k < 3; k++)
-  {
-    lv_obj_t *ring = lv_obj_create(scope);
-    lv_obj_remove_style_all(ring);
-    lv_obj_set_size(ring, rings[k] * 2, rings[k] * 2);
-    lv_obj_align(ring, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_color(ring, hx(0x12502F), 0);
-    lv_obj_set_style_border_width(ring, 1, 0);
-  }
-
-  // Crosshair.
-  lv_obj_t *hbar = lv_obj_create(scope);
-  lv_obj_remove_style_all(hbar);
-  lv_obj_set_size(hbar, RMAX * 2, 1);
-  lv_obj_align(hbar, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_bg_opa(hbar, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(hbar, hx(0x0C3320), 0);
-  lv_obj_t *vbar = lv_obj_create(scope);
-  lv_obj_remove_style_all(vbar);
-  lv_obj_set_size(vbar, 1, RMAX * 2);
-  lv_obj_align(vbar, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_bg_opa(vbar, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(vbar, hx(0x0C3320), 0);
-
-  // Sweep beam + one fading trail (create trail first so the bright beam is on top).
-  const lv_opa_t trailOpa[NTRAIL] = { 255, 110 };
-  for (int k = NTRAIL - 1; k >= 0; k--)
-  {
-    beamLine[k] = lv_line_create(scope);
-    lv_obj_remove_style_all(beamLine[k]);
-    lv_obj_set_pos(beamLine[k], 0, 0);
-    lv_obj_set_style_line_width(beamLine[k], k == 0 ? 3 : 2, 0);
-    lv_obj_set_style_line_color(beamLine[k], hx(0x39FF88), 0);
-    lv_obj_set_style_line_opa(beamLine[k], trailOpa[k], 0);
-  }
-
-  // Center dot.
-  lv_obj_t *dot = lv_obj_create(scope);
-  lv_obj_remove_style_all(dot);
-  lv_obj_set_size(dot, 8, 8);
-  lv_obj_align(dot, LV_ALIGN_CENTER, 0, 0);
-  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
-  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-  lv_obj_set_style_bg_color(dot, hx(0x39FF88), 0);
-
-  // Blip pool (positioned/colored/shown each tick).  Opaque + brightness-glow,
-  // so no per-frame alpha blending.
-  for (int i = 0; i < RADAR_NB; i++)
-  {
-    blip[i] = lv_obj_create(scope);
-    lv_obj_remove_style_all(blip[i]);
-    lv_obj_set_size(blip[i], BLIP, BLIP);
-    lv_obj_set_style_radius(blip[i], LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(blip[i], LV_OPA_COVER, 0);
-    lv_obj_add_flag(blip[i], LV_OBJ_FLAG_HIDDEN);
-  }
-}
-
 void ui_init()
 {
   // Global dark background on the active screen.
@@ -435,13 +319,11 @@ void ui_init()
   tabStats  = lv_tabview_add_tab(tabview, "STATS");
   tabAlert  = lv_tabview_add_tab(tabview, "ALERT");
   tabHunter = lv_tabview_add_tab(tabview, "HUNTER");
-  tabRadar  = lv_tabview_add_tab(tabview, "RADAR");
 
   buildLive();
   buildStats();
   buildAlert();
   buildHunter();
-  buildRadar();
 
   // Always-visible status dots on the top layer (render above every tab). Made
   // non-clickable so taps fall through to the tab bar underneath.
@@ -661,60 +543,6 @@ static void refreshLabels(uint32_t now)
   lastLabelTick = now;
 }
 
-// Animate the radar sweep + blips (~25 fps).  Only runs while the RADAR tab is
-// showing, so it costs nothing on the other screens.
-static void radar_tick(uint32_t now)
-{
-  if (lv_tabview_get_tab_active(tabview) != RADAR_TAB_IDX) return;
-  if (now - lastRadarMs < 60) return;
-  lastRadarMs = now;
-
-  sweepDeg += 6;
-  if (sweepDeg >= 360) sweepDeg -= 360;
-
-  // Sweep beam + one trailing segment a few degrees behind.
-  for (int k = 0; k < NTRAIL; k++)
-  {
-    float a = (sweepDeg - k * 6) * DEG2RAD;
-    beamPts[k][0].x = RCX;
-    beamPts[k][0].y = RCY;
-    beamPts[k][1].x = (int32_t)(RCX + RMAX * cosf(a));
-    beamPts[k][1].y = (int32_t)(RCY + RMAX * sinf(a));
-    lv_line_set_points(beamLine[k], beamPts[k], 2);
-  }
-
-  // Plot a blip for each device seen in the last 60 s (most-recent first).
-  int shown = 0;
-  for (int i = 0; i < g_devCount && shown < RADAR_NB; i++)
-  {
-    if (now - g_dev[i].lastSeenMs > 60000) continue;
-    DeviceEntry &d = g_dev[i];
-
-    int ang = macAngle(d.mac);
-    int v = ((int)d.rssi + 95) * 100 / 60;      // -95..-35 dBm -> 0..100
-    if (v < 0) v = 0; if (v > 100) v = 100;
-    int r = 24 + (100 - v) * (RMAX - 30) / 100; // strong signal -> near center
-    float a = ang * DEG2RAD;
-    int bx = (int)(RCX + r * cosf(a)) - BLIP / 2;
-    int by = (int)(RCY + r * sinf(a)) - BLIP / 2;
-
-    // Glow: flare as the beam passes the blip's bearing, then decay.  Encoded as
-    // COLOR brightness (blip stays fully opaque -> no per-frame alpha blending).
-    int diff = abs(ang - sweepDeg);
-    if (diff > 180) diff = 360 - diff;
-    if (diff < 12) devBright[i] = 255;
-    else { int b = (int)devBright[i] - 14; devBright[i] = (uint8_t)(b < 80 ? 80 : b); }
-    int pct = 30 + ((int)devBright[i] - 80) * 70 / 175;   // 80..255 -> 30..100%
-
-    lv_obj_set_pos(blip[shown], bx, by);
-    lv_obj_set_style_bg_color(blip[shown], hx(dimColor(methodColorHex(d.method), pct)), 0);
-    lv_obj_remove_flag(blip[shown], LV_OBJ_FLAG_HIDDEN);
-    shown++;
-  }
-  for (int i = shown; i < RADAR_NB; i++)
-    lv_obj_add_flag(blip[i], LV_OBJ_FLAG_HIDDEN);
-}
-
 void ui_tick(uint32_t now)
 {
   if (now - lastLabelTick >= UI_TICK_MS)
@@ -725,6 +553,4 @@ void ui_tick(uint32_t now)
     g_uiDirty = false;
     rebuildLiveList(now);
   }
-
-  radar_tick(now);
 }
