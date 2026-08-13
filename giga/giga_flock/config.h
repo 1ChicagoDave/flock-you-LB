@@ -33,7 +33,7 @@
 // Landscape.  Arduino_H7_Video handles the panel rotation from these dims.
 #define SCREEN_W       800
 #define SCREEN_H       480
-#define TABBAR_H       44
+#define TABBAR_H       64       // taller tab bar = bigger, easier touch targets
 #define LIVE_MAX_ROWS  14       // rows that fit on the LIVE list
 #define UI_TICK_MS     200      // label refresh cadence
 #define LIVE_REBUILD_MS 400     // min interval between LIVE list rebuilds

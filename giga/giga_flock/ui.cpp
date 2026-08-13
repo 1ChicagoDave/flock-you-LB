@@ -64,9 +64,30 @@ static lv_obj_t *alMac, *alMethod, *alRssi, *alAge, *alChGps;
 static lv_obj_t *hnMac, *hnRssiLbl, *hnArc;
 // Always-visible status LEDs (top-right overlay)
 static lv_obj_t *ledLink, *ledGps;
+// Full-screen detection flash overlay (background = detection-class color, like
+// the onboard RGB LED).  Held on-screen >=5 s / while the camera keeps pinging.
+static lv_obj_t *alertScreen, *asMethod, *asRssi, *asMac, *asSub;
+static uint32_t  alertUntil = 0;
 
 // ---- small helpers ----
 static lv_color_t hx(uint32_t rgb) { return lv_color_hex(rgb); }
+
+// Scale an 0xRRGGBB color to `pct` percent brightness (for a readable tinted bg).
+static uint32_t dimColor(uint32_t rgb, uint8_t pct)
+{
+  uint32_t r = ((rgb >> 16) & 0xFF) * pct / 100;
+  uint32_t g = ((rgb >> 8)  & 0xFF) * pct / 100;
+  uint32_t b = ( rgb        & 0xFF) * pct / 100;
+  return (r << 16) | (g << 8) | b;
+}
+
+// Tap anywhere on the flash overlay to dismiss it early.
+static void alert_dismiss_cb(lv_event_t *e)
+{
+  (void)e;
+  lv_obj_add_flag(alertScreen, LV_OBJ_FLAG_HIDDEN);
+  alertUntil = 0;
+}
 
 // GT911 point struct name in Arduino_GigaDisplayTouch is GDTpoint_t.
 static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
@@ -244,6 +265,41 @@ static void buildHunter()
   lv_obj_center(hnRssiLbl);
 }
 
+// Full-screen overlay that flashes the detection-class color and shows the hit.
+static void buildAlertOverlay()
+{
+  alertScreen = lv_obj_create(lv_layer_top());
+  lv_obj_set_size(alertScreen, SCREEN_W, SCREEN_H);
+  lv_obj_align(alertScreen, LV_ALIGN_TOP_LEFT, 0, 0);
+  lv_obj_set_style_border_width(alertScreen, 0, 0);
+  lv_obj_set_style_radius(alertScreen, 0, 0);
+  lv_obj_set_style_pad_all(alertScreen, 24, 0);
+  lv_obj_set_style_bg_color(alertScreen, hx(COL_BG), 0);
+  lv_obj_set_flex_flow(alertScreen, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(alertScreen, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_flag(alertScreen, LV_OBJ_FLAG_HIDDEN);         // shown on detection
+  lv_obj_add_event_cb(alertScreen, alert_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+  asMethod = lv_label_create(alertScreen);          // class name, in class color
+  lv_label_set_text(asMethod, "");
+  lv_obj_set_style_text_font(asMethod, &lv_font_montserrat_48, 0);
+
+  asRssi = lv_label_create(alertScreen);            // big RSSI
+  lv_label_set_text(asRssi, "");
+  lv_obj_set_style_text_font(asRssi, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(asRssi, hx(0xFFFFFF), 0);
+
+  asMac = lv_label_create(alertScreen);
+  lv_label_set_text(asMac, "");
+  lv_obj_set_style_text_font(asMac, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(asMac, hx(0xFFFFFF), 0);
+
+  asSub = lv_label_create(alertScreen);             // ch / count / age / gps
+  lv_label_set_text(asSub, "");
+  lv_obj_set_style_text_font(asSub, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(asSub, hx(0xF0F0F0), 0);
+}
+
 void ui_init()
 {
   // Global dark background on the active screen.
@@ -253,6 +309,8 @@ void ui_init()
   tabview = lv_tabview_create(lv_scr_act());
   lv_tabview_set_tab_bar_size(tabview, TABBAR_H);
   lv_obj_set_style_bg_color(tabview, hx(COL_BG), 0);
+  // Bigger tab labels -> easier touch targets.
+  lv_obj_set_style_text_font(lv_tabview_get_tab_bar(tabview), &lv_font_montserrat_20, 0);
 
   tabLive   = lv_tabview_add_tab(tabview, "LIVE");
   tabStats  = lv_tabview_add_tab(tabview, "STATS");
@@ -269,18 +327,20 @@ void ui_init()
   //   ledLink : green = ESP32 link alive, red = no link
   //   ledGps  : blue  = GPS fix, dim = no fix
   ledGps = lv_led_create(lv_layer_top());
-  lv_obj_set_size(ledGps, 12, 12);
-  lv_obj_align(ledGps, LV_ALIGN_TOP_RIGHT, -26, 9);
+  lv_obj_set_size(ledGps, 14, 14);
+  lv_obj_align(ledGps, LV_ALIGN_TOP_RIGHT, -30, TABBAR_H + 8);
   lv_obj_remove_flag(ledGps, LV_OBJ_FLAG_CLICKABLE);
   lv_led_set_color(ledGps, hx(COL_ADDR1));
   lv_led_off(ledGps);
 
   ledLink = lv_led_create(lv_layer_top());
-  lv_obj_set_size(ledLink, 12, 12);
-  lv_obj_align(ledLink, LV_ALIGN_TOP_RIGHT, -8, 9);
+  lv_obj_set_size(ledLink, 14, 14);
+  lv_obj_align(ledLink, LV_ALIGN_TOP_RIGHT, -8, TABBAR_H + 8);
   lv_obj_remove_flag(ledLink, LV_OBJ_FLAG_CLICKABLE);
   lv_led_set_color(ledLink, hx(COL_BAD));
   lv_led_on(ledLink);
+
+  buildAlertOverlay();
 
   register_touch();
 }
@@ -429,6 +489,46 @@ static void refreshLabels(uint32_t now)
     lv_label_set_text(hnRssiLbl, "--");
     lv_arc_set_value(hnArc, 0);
     lv_obj_set_style_text_color(hnRssiLbl, hx(COL_TEXT), 0);
+  }
+
+  // ---- detection flash overlay (bg = class color, like the RGB LED) ----
+  // Re-arm whenever a new sighting lands (g_lastDetMs bumps on every hit); hold
+  // the overlay >=5 s past the latest sighting so it stays while the camera is
+  // in range and lingers long enough to read.
+  static uint32_t shownDetMs = 0;
+  if (g_lastDetMs != shownDetMs && g_lastDevIdx >= 0 && g_lastDevIdx < g_devCount)
+  {
+    shownDetMs = g_lastDetMs;
+    DeviceEntry &d = g_dev[g_lastDevIdx];
+    uint32_t c = methodColorHex(d.method);
+    lv_obj_set_style_bg_color(alertScreen, hx(dimColor(c, 45)), 0);
+    lv_label_set_text(asMethod, d.method);
+    lv_obj_set_style_text_color(asMethod, hx(c), 0);
+    lv_label_set_text_fmt(asRssi, "%d dBm", (int)d.rssi);
+    lv_label_set_text(asMac, d.mac);
+    lv_obj_remove_flag(alertScreen, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(alertScreen);
+    alertUntil = now + 5000;
+  }
+  if (!lv_obj_has_flag(alertScreen, LV_OBJ_FLAG_HIDDEN))
+  {
+    if (now >= alertUntil)
+    {
+      lv_obj_add_flag(alertScreen, LV_OBJ_FLAG_HIDDEN);
+    }
+    else if (g_lastDevIdx >= 0 && g_lastDevIdx < g_devCount)
+    {
+      DeviceEntry &d = g_dev[g_lastDevIdx];
+      uint32_t ageS = (now - g_lastDetMs) / 1000;
+      if (g_gps.hasFix)
+        snprintf(buf, sizeof(buf), "ch %u   count %u   %lus ago   %.5f, %.5f",
+                 (unsigned)d.channel, (unsigned)d.count, (unsigned long)ageS,
+                 g_gps.lat, g_gps.lon);
+      else
+        snprintf(buf, sizeof(buf), "ch %u   count %u   %lus ago   (no GPS fix)",
+                 (unsigned)d.channel, (unsigned)d.count, (unsigned long)ageS);
+      lv_label_set_text(asSub, buf);
+    }
   }
 
   // ---- status LEDs (always visible) ----
