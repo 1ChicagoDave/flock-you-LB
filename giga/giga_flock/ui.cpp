@@ -61,7 +61,9 @@ static lv_obj_t *stUniq, *stEvents, *stChan, *stLink, *stPkts, *stGps, *stLog;
 // ALERT labels
 static lv_obj_t *alMac, *alMethod, *alRssi, *alAge, *alChGps;
 // HUNTER
-static lv_obj_t *hnMac, *hnRssiLbl, *hnBar;
+static lv_obj_t *hnMac, *hnRssiLbl, *hnArc;
+// Always-visible status LEDs (top-right overlay)
+static lv_obj_t *ledLink, *ledGps;
 
 // ---- small helpers ----
 static lv_color_t hx(uint32_t rgb) { return lv_color_hex(rgb); }
@@ -219,17 +221,27 @@ static void buildHunter()
   lv_obj_set_style_text_font(hnMac, &lv_font_montserrat_28, 0);
   lv_obj_set_style_text_color(hnMac, hx(COL_TEXT), 0);
 
-  hnRssiLbl = lv_label_create(col);
-  lv_label_set_text(hnRssiLbl, "-- dBm");
+  // Radial signal-strength gauge.  270° sweep; the big dBm readout lives in the
+  // middle.  Display-only (not draggable), knob hidden.  The indicator color and
+  // the center number shift green -> amber -> red as the target gets closer.
+  hnArc = lv_arc_create(col);
+  lv_obj_set_size(hnArc, 300, 300);
+  lv_arc_set_rotation(hnArc, 135);
+  lv_arc_set_bg_angles(hnArc, 0, 270);
+  lv_arc_set_range(hnArc, 0, 100);
+  lv_arc_set_value(hnArc, 0);
+  lv_obj_remove_flag(hnArc, LV_OBJ_FLAG_CLICKABLE);   // display-only
+  lv_obj_set_style_arc_width(hnArc, 22, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(hnArc, hx(0x203040), LV_PART_MAIN);
+  lv_obj_set_style_arc_width(hnArc, 22, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_color(hnArc, hx(COL_OK), LV_PART_INDICATOR);
+  lv_obj_set_style_bg_opa(hnArc, LV_OPA_TRANSP, LV_PART_KNOB);  // hide knob
+
+  hnRssiLbl = lv_label_create(hnArc);
+  lv_label_set_text(hnRssiLbl, "--");
   lv_obj_set_style_text_font(hnRssiLbl, &lv_font_montserrat_48, 0);
   lv_obj_set_style_text_color(hnRssiLbl, hx(COL_TEXT), 0);
-
-  hnBar = lv_bar_create(col);
-  lv_obj_set_size(hnBar, 640, 34);
-  lv_bar_set_range(hnBar, 0, 100);
-  lv_bar_set_value(hnBar, 0, LV_ANIM_OFF);
-  lv_obj_set_style_bg_color(hnBar, hx(0x203040), LV_PART_MAIN);
-  lv_obj_set_style_bg_color(hnBar, hx(COL_OK), LV_PART_INDICATOR);
+  lv_obj_center(hnRssiLbl);
 }
 
 void ui_init()
@@ -251,6 +263,24 @@ void ui_init()
   buildStats();
   buildAlert();
   buildHunter();
+
+  // Always-visible status dots on the top layer (render above every tab). Made
+  // non-clickable so taps fall through to the tab bar underneath.
+  //   ledLink : green = ESP32 link alive, red = no link
+  //   ledGps  : blue  = GPS fix, dim = no fix
+  ledGps = lv_led_create(lv_layer_top());
+  lv_obj_set_size(ledGps, 12, 12);
+  lv_obj_align(ledGps, LV_ALIGN_TOP_RIGHT, -26, 9);
+  lv_obj_remove_flag(ledGps, LV_OBJ_FLAG_CLICKABLE);
+  lv_led_set_color(ledGps, hx(COL_ADDR1));
+  lv_led_off(ledGps);
+
+  ledLink = lv_led_create(lv_layer_top());
+  lv_obj_set_size(ledLink, 12, 12);
+  lv_obj_align(ledLink, LV_ALIGN_TOP_RIGHT, -8, 9);
+  lv_obj_remove_flag(ledLink, LV_OBJ_FLAG_CLICKABLE);
+  lv_led_set_color(ledLink, hx(COL_BAD));
+  lv_led_on(ledLink);
 
   register_touch();
 }
@@ -383,19 +413,29 @@ static void refreshLabels(uint32_t now)
   {
     DeviceEntry &d = g_dev[s];
     lv_label_set_text(hnMac, d.mac);
-    lv_label_set_text_fmt(hnRssiLbl, "%d dBm", (int)d.rssi);
-    lv_obj_set_style_text_color(hnRssiLbl, hx(methodColorHex(d.method)), 0);
+    lv_label_set_text_fmt(hnRssiLbl, "%d", (int)d.rssi);   // dBm; gauge shows strength
     // Map -95..-35 dBm -> 0..100.
     int v = (int)((d.rssi + 95) * 100 / 60);
     if (v < 0) v = 0; if (v > 100) v = 100;
-    lv_bar_set_value(hnBar, v, LV_ANIM_ON);
+    lv_arc_set_value(hnArc, v);
+    // Getting-warmer color: cool green when far/weak, hot red when close/strong.
+    uint32_t ac = (v >= 66) ? COL_BAD : (v >= 33) ? COL_ADDR2 : COL_OK;
+    lv_obj_set_style_arc_color(hnArc, hx(ac), LV_PART_INDICATOR);
+    lv_obj_set_style_text_color(hnRssiLbl, hx(ac), 0);
   }
   else
   {
     lv_label_set_text(hnMac, "— none —");
-    lv_label_set_text(hnRssiLbl, "-- dBm");
-    lv_bar_set_value(hnBar, 0, LV_ANIM_OFF);
+    lv_label_set_text(hnRssiLbl, "--");
+    lv_arc_set_value(hnArc, 0);
+    lv_obj_set_style_text_color(hnRssiLbl, hx(COL_TEXT), 0);
   }
+
+  // ---- status LEDs (always visible) ----
+  lv_led_set_color(ledLink, hx(alive ? COL_OK : COL_BAD));
+  lv_led_on(ledLink);
+  if (g_gps.hasFix) { lv_led_set_color(ledGps, hx(COL_ADDR1)); lv_led_on(ledGps); }
+  else              { lv_led_off(ledGps); }
 
   lastLabelTick = now;
 }
