@@ -62,8 +62,8 @@ static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter, *tabRadar;
 #define RCX       (RADAR_D / 2)
 #define RCY       (RADAR_D / 2)
 #define RMAX      (RADAR_D / 2 - 6)   // outer ring radius
-#define RADAR_NB  40           // max simultaneous blips on the scope
-#define NTRAIL    4            // sweep beam + fading trail segments
+#define RADAR_NB  28           // max simultaneous blips on the scope
+#define NTRAIL    2            // sweep beam + fading trail segments
 #define BLIP      12           // blip diameter (px)
 #define DEG2RAD   0.0174532925f
 
@@ -346,12 +346,16 @@ static void buildRadar()
   lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(page, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
+  // NOTE: every child below gets lv_obj_remove_style_all() first — strips the
+  // default theme (borders, padding, scroll, and importantly the style
+  // TRANSITIONS that would otherwise spawn an animation on every per-frame
+  // color/opacity change and exhaust the LVGL heap in a few seconds).
   scope = lv_obj_create(page);
+  lv_obj_remove_style_all(scope);
   lv_obj_set_size(scope, RADAR_D, RADAR_D);
   lv_obj_set_style_radius(scope, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(scope, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(scope, hx(0x04160C), 0);   // very dark green
-  lv_obj_set_style_border_width(scope, 0, 0);
-  lv_obj_set_style_pad_all(scope, 0, 0);
   lv_obj_clear_flag(scope, LV_OBJ_FLAG_SCROLLABLE);
 
   // Range rings (border-only circles): outer, 2/3, 1/3.
@@ -359,57 +363,58 @@ static void buildRadar()
   for (int k = 0; k < 3; k++)
   {
     lv_obj_t *ring = lv_obj_create(scope);
+    lv_obj_remove_style_all(ring);
     lv_obj_set_size(ring, rings[k] * 2, rings[k] * 2);
     lv_obj_align(ring, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_color(ring, hx(0x12502F), 0);
     lv_obj_set_style_border_width(ring, 1, 0);
-    lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(ring, LV_OBJ_FLAG_CLICKABLE);
   }
 
   // Crosshair.
   lv_obj_t *hbar = lv_obj_create(scope);
+  lv_obj_remove_style_all(hbar);
   lv_obj_set_size(hbar, RMAX * 2, 1);
   lv_obj_align(hbar, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_opa(hbar, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(hbar, hx(0x0C3320), 0);
-  lv_obj_set_style_border_width(hbar, 0, 0);
   lv_obj_t *vbar = lv_obj_create(scope);
+  lv_obj_remove_style_all(vbar);
   lv_obj_set_size(vbar, 1, RMAX * 2);
   lv_obj_align(vbar, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_bg_opa(vbar, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(vbar, hx(0x0C3320), 0);
-  lv_obj_set_style_border_width(vbar, 0, 0);
 
-  // Sweep beam + fading trail (create trail first so the bright beam draws on top).
-  const lv_opa_t trailOpa[NTRAIL] = { 255, 150, 90, 45 };
+  // Sweep beam + one fading trail (create trail first so the bright beam is on top).
+  const lv_opa_t trailOpa[NTRAIL] = { 255, 110 };
   for (int k = NTRAIL - 1; k >= 0; k--)
   {
     beamLine[k] = lv_line_create(scope);
+    lv_obj_remove_style_all(beamLine[k]);
     lv_obj_set_pos(beamLine[k], 0, 0);
     lv_obj_set_style_line_width(beamLine[k], k == 0 ? 3 : 2, 0);
     lv_obj_set_style_line_color(beamLine[k], hx(0x39FF88), 0);
     lv_obj_set_style_line_opa(beamLine[k], trailOpa[k], 0);
-    lv_obj_set_style_line_rounded(beamLine[k], true, 0);
   }
 
   // Center dot.
   lv_obj_t *dot = lv_obj_create(scope);
+  lv_obj_remove_style_all(dot);
   lv_obj_set_size(dot, 8, 8);
   lv_obj_align(dot, LV_ALIGN_CENTER, 0, 0);
   lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(dot, hx(0x39FF88), 0);
-  lv_obj_set_style_border_width(dot, 0, 0);
 
-  // Blip pool (positioned/colored/shown each tick).
+  // Blip pool (positioned/colored/shown each tick).  Opaque + brightness-glow,
+  // so no per-frame alpha blending.
   for (int i = 0; i < RADAR_NB; i++)
   {
     blip[i] = lv_obj_create(scope);
+    lv_obj_remove_style_all(blip[i]);
     lv_obj_set_size(blip[i], BLIP, BLIP);
     lv_obj_set_style_radius(blip[i], LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(blip[i], 0, 0);
-    lv_obj_clear_flag(blip[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_remove_flag(blip[i], LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(blip[i], LV_OPA_COVER, 0);
     lv_obj_add_flag(blip[i], LV_OBJ_FLAG_HIDDEN);
   }
 }
@@ -661,16 +666,16 @@ static void refreshLabels(uint32_t now)
 static void radar_tick(uint32_t now)
 {
   if (lv_tabview_get_tab_active(tabview) != RADAR_TAB_IDX) return;
-  if (now - lastRadarMs < 40) return;
+  if (now - lastRadarMs < 60) return;
   lastRadarMs = now;
 
-  sweepDeg += 4;
+  sweepDeg += 6;
   if (sweepDeg >= 360) sweepDeg -= 360;
 
-  // Sweep beam + trailing segments, each a few degrees behind the last.
+  // Sweep beam + one trailing segment a few degrees behind.
   for (int k = 0; k < NTRAIL; k++)
   {
-    float a = (sweepDeg - k * 5) * DEG2RAD;
+    float a = (sweepDeg - k * 6) * DEG2RAD;
     beamPts[k][0].x = RCX;
     beamPts[k][0].y = RCY;
     beamPts[k][1].x = (int32_t)(RCX + RMAX * cosf(a));
@@ -693,15 +698,16 @@ static void radar_tick(uint32_t now)
     int bx = (int)(RCX + r * cosf(a)) - BLIP / 2;
     int by = (int)(RCY + r * sinf(a)) - BLIP / 2;
 
-    // Glow: full-bright as the beam passes the blip's bearing, then decays.
+    // Glow: flare as the beam passes the blip's bearing, then decay.  Encoded as
+    // COLOR brightness (blip stays fully opaque -> no per-frame alpha blending).
     int diff = abs(ang - sweepDeg);
     if (diff > 180) diff = 360 - diff;
-    if (diff < 10) devBright[i] = 255;
-    else { int b = (int)devBright[i] - 12; devBright[i] = (uint8_t)(b < 70 ? 70 : b); }
+    if (diff < 12) devBright[i] = 255;
+    else { int b = (int)devBright[i] - 14; devBright[i] = (uint8_t)(b < 80 ? 80 : b); }
+    int pct = 30 + ((int)devBright[i] - 80) * 70 / 175;   // 80..255 -> 30..100%
 
     lv_obj_set_pos(blip[shown], bx, by);
-    lv_obj_set_style_bg_color(blip[shown], hx(methodColorHex(d.method)), 0);
-    lv_obj_set_style_bg_opa(blip[shown], devBright[i], 0);
+    lv_obj_set_style_bg_color(blip[shown], hx(dimColor(methodColorHex(d.method), pct)), 0);
     lv_obj_remove_flag(blip[shown], LV_OBJ_FLAG_HIDDEN);
     shown++;
   }
