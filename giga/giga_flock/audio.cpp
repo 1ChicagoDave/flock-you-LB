@@ -16,7 +16,7 @@
 #include "audio.h"
 #include "config.h"
 
-// #define ALT_MBED_ANALOGOUT 1   // uncomment to use mbed::AnalogOut instead
+#define ALT_MBED_ANALOGOUT 1   // uncomment to use mbed::AnalogOut instead
 
 #ifdef ALT_MBED_ANALOGOUT
   #include "mbed.h"
