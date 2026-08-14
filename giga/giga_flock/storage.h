@@ -21,3 +21,11 @@ bool storage_append_event(const char *mac, const char *method, int rssi,
 
 // True once the log is mounted and writable.
 bool storage_ready();
+
+// Stream the whole /fs/detections.csv to USB Serial (for `d` serial command).
+void storage_dump_csv();
+
+// Device-table snapshot so hit counts survive a reboot/power cycle.
+// save writes /fs/fy_table.bin; load restores g_dev / g_devCount / g_totalEvents.
+void storage_save_table();
+bool storage_load_table();

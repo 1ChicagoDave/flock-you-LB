@@ -23,6 +23,7 @@
 
 #include "storage.h"
 #include "config.h"
+#include "flock_types.h"      // g_dev / g_devCount / g_totalEvents for the snapshot
 
 #include "BlockDevice.h"
 #include "MBRBlockDevice.h"
@@ -66,12 +67,18 @@ bool storage_init()
     return false;
   }
 
-  // Is this a fresh file?  (No access()/stat() dependency — just probe read.)
+  // Fresh file?  Treat "missing" OR "exists but 0 bytes" as new so the header is
+  // (re)written — a 0-byte file is what a prior non-durable run left behind.
   bool isNew = false;
   {
     FILE *probe = fopen(LOG_PATH, "r");
-    if (probe) fclose(probe);
-    else       isNew = true;
+    if (probe)
+    {
+      fseek(probe, 0, SEEK_END);
+      if (ftell(probe) == 0) isNew = true;
+      fclose(probe);
+    }
+    else isNew = true;
   }
 
   s_log = fopen(LOG_PATH, "a");
@@ -85,10 +92,98 @@ bool storage_init()
   {
     fprintf(s_log, "%s\n", LOG_HEADER);
     fflush(s_log);
+    // Commit the header (and its FAT directory entry) to flash — see the note in
+    // storage_append_event about why fflush alone is not durable.
+    fclose(s_log);
+    s_log = fopen(LOG_PATH, "a");
+    if (!s_log) { s_fs.unmount(); return false; }
   }
 
   s_ready = true;
   return true;
+}
+
+// ---- Device-table snapshot (survives reboot so hit counts persist) ----------
+// Binary blob at /fs/fy_table.bin: header + raw DeviceEntry array.  recSize guards
+// against a struct-layout change (a mismatched file is ignored, starts fresh).
+#define SNAP_PATH  "/fs/fy_table.bin"
+struct SnapHeader { char magic[4]; uint16_t ver; uint16_t recSize; uint32_t count; uint32_t totalEvents; };
+
+void storage_save_table()
+{
+  if (!s_ready) return;
+  FILE *f = fopen(SNAP_PATH, "wb");
+  if (!f) return;
+  SnapHeader h;
+  memcpy(h.magic, "FYG1", 4);
+  h.ver = 1;
+  h.recSize = (uint16_t)sizeof(DeviceEntry);
+  h.count = (uint32_t)g_devCount;
+  h.totalEvents = g_totalEvents;
+  fwrite(&h, sizeof(h), 1, f);
+  if (g_devCount > 0) fwrite(g_dev, sizeof(DeviceEntry), g_devCount, f);
+  fclose(f);                    // close = commit to flash
+}
+
+bool storage_load_table()
+{
+  if (!s_ready) return false;
+  FILE *f = fopen(SNAP_PATH, "rb");
+  if (!f) return false;
+  SnapHeader h;
+  if (fread(&h, sizeof(h), 1, f) != 1 ||
+      memcmp(h.magic, "FYG1", 4) != 0 ||
+      h.recSize != sizeof(DeviceEntry) ||
+      h.count > MAX_DEVICES)
+  {
+    fclose(f);
+    return false;
+  }
+  size_t n = fread(g_dev, sizeof(DeviceEntry), h.count, f);
+  fclose(f);
+  g_devCount    = (int)n;
+  g_totalEvents = h.totalEvents;
+
+  // millis() restarts at 0 on boot, so stored timestamps are meaningless now —
+  // zero them so restored devices read as "old" (not falsely just-seen) and the
+  // keepalive re-logs them cleanly when next sighted.
+  for (int i = 0; i < g_devCount; i++)
+  {
+    g_dev[i].firstSeenMs = 0;
+    g_dev[i].lastSeenMs  = 0;
+    g_dev[i].lastEventMs = 0;
+  }
+  return g_devCount > 0;
+}
+
+void storage_dump_csv()
+{
+  if (!s_ready)
+  {
+    Serial.println("[log DISABLED — QSPI user partition not formatted; run QSPIFormat]");
+    return;
+  }
+  // Close the append handle so we read a fully-committed on-disk view (mbed FAT
+  // doesn't always expose an open write handle's bytes to a second read handle).
+  if (s_log) { fclose(s_log); s_log = nullptr; }
+
+  FILE *f = fopen(LOG_PATH, "r");
+  if (!f)
+  {
+    Serial.println("[no CSV file yet — nothing has been logged]");
+    s_log = fopen(LOG_PATH, "a");      // reopen for continued logging
+    return;
+  }
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  Serial.print("----- BEGIN detections.csv ("); Serial.print(sz); Serial.println(" bytes) -----");
+  char line[256];
+  while (fgets(line, sizeof(line), f)) Serial.print(line);
+  fclose(f);
+  Serial.println("----- END detections.csv -----");
+
+  s_log = fopen(LOG_PATH, "a");        // reopen for continued logging
 }
 
 bool storage_append_event(const char *mac, const char *method, int rssi,
@@ -106,8 +201,12 @@ bool storage_append_event(const char *mac, const char *method, int rssi,
           (unsigned long)utc, (unsigned long)sats, hdop,
           ssid ? ssid : "");
 
-  // Flush every append so a power loss keeps the log intact.  If throughput
-  // ever matters this can be batched (flush every N rows or on a timer).
+  // Durability: fflush pushes the stdio buffer to the file layer but does NOT
+  // update the FAT directory entry, so after a reboot/power-loss the file would
+  // read as 0 bytes.  close+reopen commits the row (data + dir entry) to flash.
+  // Detections are sparse, so the per-append open/close cost is negligible.
   fflush(s_log);
-  return true;
+  fclose(s_log);
+  s_log = fopen(LOG_PATH, "a");
+  return (s_log != nullptr);
 }

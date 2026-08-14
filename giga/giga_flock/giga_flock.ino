@@ -187,36 +187,43 @@ static double metresBetween(double lat1, double lon1, double lat2, double lon2)
 static void maybeLogEvent(int idx)
 {
   if (idx < 0) return;
-  if (!g_gps.hasFix) return;                 // no fix -> no event row
 
   DeviceEntry &d = g_dev[idx];
   uint32_t now = millis();
 
+  // Log EVERY detection; geotag it when we have a fix (matches the ESP32 build).
+  // With a fix we suppress stationary repeats by distance moved; without a fix we
+  // fall back to a time-based keepalive, so hits are still captured (ungeotagged).
+  bool haveLastPos = (d.lastEventLat != 0.0) || (d.lastEventLon != 0.0);
   bool doLog = false;
   if (!d.hasLoggedEvent)
   {
     doLog = true;                            // first event for this MAC
   }
-  else
+  else if (g_gps.hasFix && haveLastPos)
   {
     double moved = metresBetween(d.lastEventLat, d.lastEventLon,
                                  g_gps.lat, g_gps.lon);
     if (moved >= EVENT_MIN_DISTANCE_M) doLog = true;
     else if (now - d.lastEventMs >= EVENT_MIN_INTERVAL_MS) doLog = true;  // keepalive
   }
+  else
+  {
+    if (now - d.lastEventMs >= EVENT_MIN_INTERVAL_MS) doLog = true;       // no fix: keepalive only
+  }
   if (!doLog) return;
 
-  // Count the event regardless of whether the write persists (reflects activity).
   g_totalEvents++;
   d.hasLoggedEvent = true;
-  d.lastEventLat = g_gps.lat;
-  d.lastEventLon = g_gps.lon;
-  d.lastEventMs  = now;
+  if (g_gps.hasFix) { d.lastEventLat = g_gps.lat; d.lastEventLon = g_gps.lon; }
+  d.lastEventMs = now;
 
   if (g_logReady)
   {
     storage_append_event(d.mac, d.method, d.rssi, d.channel,
-                         g_gps.lat, g_gps.lon, g_gps.utc,
+                         g_gps.hasFix ? g_gps.lat : 0.0,
+                         g_gps.hasFix ? g_gps.lon : 0.0,
+                         g_gps.hasFix ? g_gps.utc : 0,
                          g_gps.sats, g_gps.hdop, d.ssid);
   }
 }
@@ -252,7 +259,11 @@ static void handleDet(JsonDocument &doc)
   ledFlashHex(methodColorHex(method));
 
   // Audio only on a brand-new unique MAC (rising two-note chirp).
-  if (isNew) audio_chirp_new();
+  if (isNew)
+  {
+    audio_chirp_new();
+    if (g_logReady) storage_save_table();   // persist the new unique device now
+  }
 }
 
 static void handleStatus(JsonDocument &doc)
@@ -356,7 +367,57 @@ void setup()
   g_logReady = storage_init();
   Serial.println(g_logReady ? "[giga] QSPI log ready" : "[giga] QSPI log DISABLED");
 
+  // Reload the persisted device table so hit counts survive a power cycle.
+  if (g_logReady && storage_load_table())
+  {
+    Serial.print("[giga] restored "); Serial.print(g_devCount);
+    Serial.print(" devices, "); Serial.print((unsigned long)g_totalEvents);
+    Serial.println(" events from snapshot");
+    g_uiDirty = true;
+  }
+
   audio_boot();
+}
+
+// Simple USB-serial console:  t = status,  d = dump the CSV log.
+static void serialCmdTick()
+{
+  if (!Serial.available()) return;
+  int c = Serial.read();
+  if (c == 't' || c == 'T')
+  {
+    Serial.println("=== GIGA status ===");
+    Serial.print("QSPI log   : "); Serial.println(g_logReady ? "READY" : "DISABLED (needs one-time QSPIFormat)");
+    Serial.print("unique dev : "); Serial.println(g_devCount);
+    Serial.print("events log : "); Serial.println((unsigned long)g_totalEvents);
+    Serial.print("ESP32 link : "); Serial.println(g_link.everSeen ? "seen" : "never");
+    Serial.print("GPS        : ");
+    if (g_gps.hasFix)
+    {
+      Serial.print("FIX sats="); Serial.print((unsigned long)g_gps.sats);
+      Serial.print(" "); Serial.print(g_gps.lat, 5);
+      Serial.print(","); Serial.println(g_gps.lon, 5);
+    }
+    else
+    {
+      Serial.print("no fix (sats="); Serial.print((unsigned long)g_gps.sats); Serial.println(")");
+    }
+  }
+  else if (c == 'd' || c == 'D')
+  {
+    storage_dump_csv();
+  }
+}
+
+// Periodic table checkpoint so re-sighting count growth survives a power cut
+// (new unique devices are saved immediately in handleDet).
+static void tableSaveTick(uint32_t now)
+{
+  static uint32_t lastSave = 0;
+  if (!g_logReady || g_devCount == 0) return;
+  if (now - lastSave < 60000UL) return;
+  lastSave = now;
+  storage_save_table();
 }
 
 void loop()
@@ -367,6 +428,8 @@ void loop()
   pollGps();            // parse NMEA, refresh fix state
   ledTick(now);         // clear the class-color flash after LED_FLASH_MS
   ui_tick(now);         // refresh LVGL labels / LIVE list from global state
+  serialCmdTick();      // USB-serial console (t=status, d=dump CSV)
+  tableSaveTick(now);   // periodic device-table snapshot to QSPI
 
   lv_timer_handler();   // LVGL rendering + input (Arduino_H7_Video drives the tick)
   delay(3);
