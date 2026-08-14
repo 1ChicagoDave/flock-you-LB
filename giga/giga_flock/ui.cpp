@@ -60,7 +60,8 @@ static uint32_t  lastLiveRebuild = 0;
 static uint32_t  lastLabelTick    = 0;
 
 // STATS labels
-static lv_obj_t *stUniq, *stEvents, *stChan, *stLink, *stPkts, *stGps, *stLog;
+static lv_obj_t *stUniq, *stEvents, *stSessUniq, *stSessEvents,
+                *stChan, *stLink, *stPkts, *stGps, *stLog;
 // ALERT labels
 static lv_obj_t *alMac, *alMethod, *alRssi, *alAge, *alChGps;
 // HUNTER
@@ -180,9 +181,11 @@ static void buildStats()
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_style_pad_all(col, 8, 0);
 
-  stUniq   = makeStatRow(col, "Unique devices");
-  stEvents = makeStatRow(col, "Total events");
-  stChan   = makeStatRow(col, "Channel");
+  stUniq       = makeStatRow(col, "Unique devices");
+  stEvents     = makeStatRow(col, "Total events");
+  stSessUniq   = makeStatRow(col, "Unique (this drive)");
+  stSessEvents = makeStatRow(col, "Events (this drive)");
+  stChan       = makeStatRow(col, "Channel");
   stLink   = makeStatRow(col, "ESP32 link");
   stPkts   = makeStatRow(col, "Pkts / uniq");
   stGps    = makeStatRow(col, "GPS");
@@ -421,6 +424,8 @@ static void refreshLabels(uint32_t now)
   // ---- STATS ----
   lv_label_set_text_fmt(stUniq,   "%d", g_devCount);
   lv_label_set_text_fmt(stEvents, "%lu", (unsigned long)g_totalEvents);
+  lv_label_set_text_fmt(stSessUniq,   "%lu", (unsigned long)g_sessUniq);
+  lv_label_set_text_fmt(stSessEvents, "%lu", (unsigned long)g_sessEvents);
   lv_label_set_text_fmt(stChan,   "%u", (unsigned)g_link.channel);
 
   bool alive = g_link.everSeen && (now - g_link.lastStatusMs < LINK_ALIVE_MS);

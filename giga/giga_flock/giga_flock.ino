@@ -97,6 +97,13 @@ uint32_t      g_lastDetMs   = 0;
 bool          g_logReady    = false;
 volatile bool g_uiDirty     = false;
 
+// This-drive counters (reset every boot; NOT persisted).  g_sessUniq = distinct
+// devices sighted this session (incl. ones reloaded from a prior drive but seen
+// again now); g_sessEvents = event rows logged this session.
+uint32_t      g_sessUniq    = 0;
+uint32_t      g_sessEvents  = 0;
+static bool   sessionSeen[MAX_DEVICES] = { false };  // per-device "seen this session"
+
 // ---- LED one-shot flash ----
 static uint32_t ledOffAt = 0;
 
@@ -214,6 +221,7 @@ static void maybeLogEvent(int idx)
   if (!doLog) return;
 
   g_totalEvents++;
+  g_sessEvents++;
   d.hasLoggedEvent = true;
   if (g_gps.hasFix) { d.lastEventLat = g_gps.lat; d.lastEventLon = g_gps.lon; }
   d.lastEventMs = now;
@@ -251,6 +259,13 @@ static void handleDet(JsonDocument &doc)
   g_lastDevIdx = idx;
   g_lastDetMs  = millis();
   g_uiDirty    = true;
+
+  // Count this device once per session (first time it's sighted since boot).
+  if (idx >= 0 && idx < MAX_DEVICES && !sessionSeen[idx])
+  {
+    sessionSeen[idx] = true;
+    g_sessUniq++;
+  }
 
   // Geotag + append-only event log (stationary suppression inside).
   maybeLogEvent(idx);

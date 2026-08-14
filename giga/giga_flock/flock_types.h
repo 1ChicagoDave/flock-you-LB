@@ -62,6 +62,8 @@ extern LinkStatus  g_link;
 extern GpsState    g_gps;
 extern int         g_lastDevIdx;    // most-recent detection (for ALERT screen), -1 = none
 extern uint32_t    g_lastDetMs;     // millis() of most-recent detection
+extern uint32_t    g_sessUniq;      // unique devices sighted THIS session (reset on boot)
+extern uint32_t    g_sessEvents;    // event rows logged THIS session (reset on boot)
 extern bool        g_logReady;      // QSPI log mounted & writable
 extern volatile bool g_uiDirty;     // device table changed -> rebuild LIVE list
 
