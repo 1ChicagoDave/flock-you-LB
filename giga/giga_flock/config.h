@@ -35,6 +35,10 @@
 #define SCREEN_H       480
 #define TABBAR_H       64       // taller tab bar = bigger, easier touch targets
 #define LIVE_MAX_ROWS  14       // rows that fit on the LIVE list
+// HUNTER gauge diameter. Must leave room for the title + MAC labels inside
+// (SCREEN_H - TABBAR_H); oversizing it makes the tab scroll, which drags the
+// readout off-screen and costs a large repaint on every scroll frame.
+#define HUNTER_ARC_D   260
 #define UI_TICK_MS     200      // label refresh cadence
 #define LIVE_REBUILD_MS 400     // min interval between LIVE list rebuilds
 

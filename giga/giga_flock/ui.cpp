@@ -193,6 +193,7 @@ static void buildAlert()
   lv_obj_t *col = lv_obj_create(tabAlert);
   alertPane = col;                       // tinted to the class color on detection
   lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+  lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);   // fixed content, never scroll
   lv_obj_set_style_bg_color(col, hx(COL_BG), 0);
   lv_obj_set_style_border_width(col, 0, 0);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
@@ -233,7 +234,13 @@ static void buildHunter()
   lv_obj_set_style_border_width(col, 0, 0);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_all(col, 10, 0);
+  lv_obj_set_style_pad_all(col, 6, 0);
+  lv_obj_set_style_pad_row(col, 8, 0);
+  // Fixed-content screen: must fit the tab area with no scrolling.  A scrollable
+  // HUNTER let the readout be dragged off-screen while driving, and scroll
+  // momentum on the 300px arc is a large repaint (the class of draw work behind
+  // the display hangs).  Content is sized below to fit 480 - TABBAR_H.
+  lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
 
   lv_obj_t *title = lv_label_create(col);
   lv_label_set_text(title, "STRONGEST TARGET");
@@ -249,7 +256,7 @@ static void buildHunter()
   // middle.  Display-only (not draggable), knob hidden.  The indicator color and
   // the center number shift green -> amber -> red as the target gets closer.
   hnArc = lv_arc_create(col);
-  lv_obj_set_size(hnArc, 300, 300);
+  lv_obj_set_size(hnArc, HUNTER_ARC_D, HUNTER_ARC_D);
   lv_arc_set_rotation(hnArc, 135);
   lv_arc_set_bg_angles(hnArc, 0, 270);
   lv_arc_set_range(hnArc, 0, 100);
