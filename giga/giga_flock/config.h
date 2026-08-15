@@ -38,6 +38,11 @@
 #define UI_TICK_MS     200      // label refresh cadence
 #define LIVE_REBUILD_MS 400     // min interval between LIVE list rebuilds
 
+// ---- Watchdog ---------------------------------------------------------------
+// Hardware IWDG timeout. Loop normally cycles in ~5 ms, so this only fires on a
+// genuine hang (e.g. a display flush that never returns).
+#define WATCHDOG_MS    8000
+
 // ---- Link liveness ----------------------------------------------------------
 #define LINK_ALIVE_MS  6000     // ESP32 "alive" if a status arrived < this ago
 

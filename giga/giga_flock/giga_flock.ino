@@ -392,6 +392,13 @@ void setup()
   }
 
   audio_boot();
+
+  // Independent hardware watchdog (STM32H7 IWDG).  If the UI ever wedges again
+  // (a display flush that never returns takes the whole loop with it), the chip
+  // resets itself after WATCHDOG_MS instead of stranding the detector mid-drive.
+  // Safe to lose a reboot now: the CSV is committed per row and the device table
+  // is reloaded from /fs/fy_table.bin on boot, so counts and log survive.
+  mbed::Watchdog::get_instance().start(WATCHDOG_MS);
 }
 
 // Simple USB-serial console:  t = status,  d = dump the CSV log.
@@ -447,5 +454,7 @@ void loop()
   tableSaveTick(now);   // periodic device-table snapshot to QSPI
 
   lv_timer_handler();   // LVGL rendering + input (Arduino_H7_Video drives the tick)
+
+  mbed::Watchdog::get_instance().kick();   // loop is alive; defer the reset
   delay(3);
 }
