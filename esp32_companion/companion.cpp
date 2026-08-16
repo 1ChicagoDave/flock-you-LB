@@ -81,7 +81,15 @@ static const uint8_t fullHopChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
 static const size_t fullHopChannelCount = sizeof(fullHopChannels) / sizeof(fullHopChannels[0]);
 
 #define HEARTBEAT_MS 30000
-#define RSSI_MIN -95
+// RSSI floor for the sniffer ISR. Set to -100 = "accept anything the radio can
+// actually decode". The ESP32 can demodulate 1 Mbps DSSS down to ~-98 dBm, and
+// mgmt frames (beacons / probe requests — the wildcard_probe signature) are sent
+// at that lowest basic rate, so the old -95 was discarding ~3 dB of usable range
+// on the highest-confidence detection path. Frames reaching this callback have
+// already passed CRC, so a lower floor admits weaker TRUE hits, not noise; the
+// OUI + wildcard-probe checks remain the real discriminators. RSSI is recorded
+// per row, so weak hits can be filtered in analysis instead of dropped forever.
+#define RSSI_MIN -100
 #define ALERT_COOLDOWN_MS 5000
 
 // Audio cadence: two fast ascending beeps on a NEW MAC, then while any
