@@ -58,6 +58,24 @@
 // append-only event log for later triangulation.
 #define EVENT_MIN_DISTANCE_M   20.0     // metres (equirectangular approximation)
 #define EVENT_MIN_INTERVAL_MS  60000UL  // keepalive interval
+
+// ---- Breadcrumb track log ---------------------------------------------------
+// A position row every TRACK_INTERVAL_MS (only with a fix, and only if we've
+// actually moved) plus a #BOOT row each startup. This makes a quiet stretch
+// PROVABLE: you can see the detector was alive and where it was, so "no cameras
+// heard here" is distinguishable from "the log just stopped".
+#define TRACK_INTERVAL_MS      60000UL  // breadcrumb cadence
+#define TRACK_MIN_MOVE_M       25.0     // skip the breadcrumb if parked
+
+// ---- Audio re-alert ---------------------------------------------------------
+// A known camera goes silent forever once it's in the persisted table, which
+// makes a familiar commute feel dead. Re-chirp when a device reappears after
+// this long unseen (the ESP32 does the same at 30 s on its own buzzer).
+#define REDISCOVER_CHIRP_MS    300000UL // 5 minutes
+
+// ---- Alert screen behaviour -------------------------------------------------
+// How long the full alert holds before returning to the screen you were on.
+#define ALERT_HOLD_MS          6000UL
 #define LOG_PATH               "/fs/detections.csv"  // mbed FATFileSystem mount root is /fs
 #define LOG_HEADER             "mac,method,rssi,channel,lat,lon,utc,sats,hdop,ssid"
 

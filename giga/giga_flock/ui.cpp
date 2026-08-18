@@ -63,7 +63,7 @@ static uint32_t  lastLabelTick    = 0;
 static lv_obj_t *stUniq, *stEvents, *stSessUniq, *stSessEvents,
                 *stChan, *stLink, *stPkts, *stGps, *stLog;
 // ALERT labels
-static lv_obj_t *alMac, *alMethod, *alRssi, *alAge, *alChGps;
+static lv_obj_t *alMac, *alMethod, *alRssi, *alAge, *alChGps, *alBadge;
 // HUNTER
 static lv_obj_t *hnMac, *hnRssiLbl, *hnArc;
 // Always-visible status LEDs (top-right overlay)
@@ -76,6 +76,7 @@ static lv_obj_t *ledLink, *ledGps;
 // repaints only that pane — same look, a fraction of the draw work.
 static lv_obj_t *alertPane;             // the ALERT tab's content container
 static uint32_t  alertUntil = 0;        // hold the tint until this millis()
+static int32_t   alertPrevTab = -1;     // tab to restore when the alert expires
 
 // ---- small helpers ----
 static lv_color_t hx(uint32_t rgb) { return lv_color_hex(rgb); }
@@ -199,6 +200,13 @@ static void buildAlert()
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
   lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_all(col, 6, 0);
+
+  // NEW / KNOWN badge — the headline read while driving. The hit count is in the
+  // detail line but is too small to parse at speed; this is a single word.
+  alBadge = lv_label_create(col);
+  lv_label_set_text(alBadge, "");
+  lv_obj_set_style_text_font(alBadge, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(alBadge, hx(COL_TEXT), 0);
 
   alMethod = lv_label_create(col);
   lv_label_set_text(alMethod, "— no detections —");
@@ -353,8 +361,12 @@ static void rebuildLiveList(uint32_t now)
     // MAC in default color, method token recolored to its class color.
     // Pre-format with the C library snprintf (LVGL's mini-printf is unreliable
     // for %06lX), then hand the finished recolor string to the label.
-    char row[128];
-    snprintf(row, sizeof(row), "%s  #%06lX %s#  %ddBm  x%u",
+    // Leading NEW/KNOWN tag, color-coded — readable at a glance while driving.
+    bool isNewDev = g_devNew[best];
+    char row[176];
+    snprintf(row, sizeof(row), "#%06lX %-5s#  %s  #%06lX %s#  %ddBm  x%u",
+             (unsigned long)((isNewDev ? COL_OK : COL_DIM) & 0xFFFFFF),
+             isNewDev ? "NEW" : "KNOWN",
              d.mac, (unsigned long)(methodColorHex(d.method) & 0xFFFFFF),
              d.method, (int)d.rssi, (unsigned)d.count);
     lv_label_set_text(lbl, row);
@@ -422,6 +434,11 @@ static void refreshLabels(uint32_t now)
   {
     DeviceEntry &d = g_dev[g_lastDevIdx];
     uint32_t c = methodColorHex(d.method);
+
+    bool isNewDev = g_devNew[g_lastDevIdx];
+    lv_label_set_text(alBadge, isNewDev ? "NEW CAMERA" : "KNOWN");
+    lv_obj_set_style_text_color(alBadge, hx(isNewDev ? COL_OK : COL_DIM), 0);
+
     snprintf(buf, sizeof(buf), "#%06lX %s#", (unsigned long)c, d.method);
     lv_label_set_text(alMethod, buf);
     lv_obj_set_style_text_color(alMethod, hx(c), 0);
@@ -479,13 +496,23 @@ static void refreshLabels(uint32_t now)
     shownDetMs = g_lastDetMs;
     DeviceEntry &d = g_dev[g_lastDevIdx];
     lv_obj_set_style_bg_color(alertPane, hx(dimColor(methodColorHex(d.method), 40)), 0);
-    if (rising) lv_tabview_set_active(tabview, 2, LV_ANIM_OFF);   // 2 = ALERT
-    alertUntil = now + 5000;
+    if (rising)
+    {
+      // Remember where the user was so we can put them back afterwards.
+      alertPrevTab = (int32_t)lv_tabview_get_tab_active(tabview);
+      lv_tabview_set_active(tabview, 2, LV_ANIM_OFF);   // 2 = ALERT
+    }
+    alertUntil = now + ALERT_HOLD_MS;
   }
   if (alertUntil != 0 && now >= alertUntil)
   {
     lv_obj_set_style_bg_color(alertPane, hx(COL_BG), 0);          // back to normal
-    alertUntil = 0;
+    // Return to whatever screen was showing when the alert fired — but only if
+    // the user hasn't already swiped somewhere themselves during the hold.
+    if (alertPrevTab >= 0 && lv_tabview_get_tab_active(tabview) == 2)
+      lv_tabview_set_active(tabview, (uint32_t)alertPrevTab, LV_ANIM_OFF);
+    alertPrevTab = -1;
+    alertUntil   = 0;
   }
 
   // ---- status LEDs (always visible) ----

@@ -25,6 +25,13 @@ bool storage_ready();
 // Stream the whole /fs/detections.csv to USB Serial (for `d` serial command).
 void storage_dump_csv();
 
+// Append a non-detection marker row (breadcrumb / session boundary). Keeps the
+// same 10-column schema so the CSV stays machine-readable; `tag` goes in the mac
+// column and always starts with '#' (e.g. "#BOOT", "#TRK") so analysis tools can
+// filter marker rows out with a single startswith('#') test.
+bool storage_append_mark(const char *tag, double lat, double lon,
+                         uint32_t utc, uint32_t sats, double hdop);
+
 // Device-table snapshot so hit counts survive a reboot/power cycle.
 // save writes /fs/fy_table.bin; load restores g_dev / g_devCount / g_totalEvents.
 void storage_save_table();

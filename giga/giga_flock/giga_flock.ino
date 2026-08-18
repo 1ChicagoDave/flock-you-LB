@@ -104,6 +104,11 @@ uint32_t      g_sessUniq    = 0;
 uint32_t      g_sessEvents  = 0;
 static bool   sessionSeen[MAX_DEVICES] = { false };  // per-device "seen this session"
 
+// Per-device "first discovered during THIS session" — i.e. it was not in the
+// table restored from flash at boot.  Drives the NEW / KNOWN badge in the UI.
+// Index-aligned with g_dev (entries are only ever appended, never removed).
+bool          g_devNew[MAX_DEVICES] = { false };
+
 // ---- LED one-shot flash ----
 static uint32_t ledOffAt = 0;
 
@@ -252,9 +257,16 @@ static void handleDet(JsonDocument &doc)
   int   count = doc["count"] | 0;
   if (!mac[0]) return;
 
+  // Look up BEFORE the upsert so we can see how long this device has been
+  // silent (upsertDevice overwrites lastSeenMs).
+  int      existing = findDevice(mac);
+  bool     wasKnown = (existing >= 0);
+  uint32_t prevSeen = wasKnown ? g_dev[existing].lastSeenMs : 0;
+
   bool isNew = false;
   int idx = upsertDevice(mac, method, rssi, ch, ssid, count, &isNew);
   if (idx < 0) return;
+  if (isNew && idx < MAX_DEVICES) g_devNew[idx] = true;   // discovered this session
 
   g_lastDevIdx = idx;
   g_lastDetMs  = millis();
@@ -273,11 +285,16 @@ static void handleDet(JsonDocument &doc)
   // RGB LED flashes the detection-class color on every hit.
   ledFlashHex(methodColorHex(method));
 
-  // Audio only on a brand-new unique MAC (rising two-note chirp).
-  if (isNew)
+  // Audio on a brand-new unique MAC, and again when a KNOWN camera reappears
+  // after REDISCOVER_CHIRP_MS of silence — otherwise a camera you pass daily is
+  // permanently mute once it lands in the persisted table.  (Devices restored
+  // from flash have lastSeenMs zeroed, so they re-chirp once uptime passes the
+  // threshold, which is exactly the "first encounter this drive" case.)
+  bool rediscovered = wasKnown && (millis() - prevSeen >= REDISCOVER_CHIRP_MS);
+  if (isNew || rediscovered)
   {
     audio_chirp_new();
-    if (g_logReady) storage_save_table();   // persist the new unique device now
+    if (isNew && g_logReady) storage_save_table();  // persist the new unique device now
   }
 }
 
@@ -391,6 +408,14 @@ void setup()
     g_uiDirty = true;
   }
 
+  // Session boundary marker. GPS almost never has a fix this early, so the
+  // position is usually blank — the row's value is marking where one power-on
+  // ends and the next begins when reading the log back.
+  if (g_logReady)
+    storage_append_mark("#BOOT", g_gps.hasFix ? g_gps.lat : 0.0,
+                        g_gps.hasFix ? g_gps.lon : 0.0,
+                        g_gps.hasFix ? g_gps.utc : 0, g_gps.sats, g_gps.hdop);
+
   audio_boot();
 
   // Independent hardware watchdog (STM32H7 IWDG).  If the UI ever wedges again
@@ -431,6 +456,31 @@ static void serialCmdTick()
   }
 }
 
+// Breadcrumb track: one position row per TRACK_INTERVAL_MS while we have a fix
+// and are actually moving.  Parked (or indoors with no fix) it writes nothing,
+// so the log doesn't fill with a stationary device repeating itself.
+static void trackTick(uint32_t now)
+{
+  static uint32_t lastTrackMs = 0;
+  static double   lastLat = 0.0, lastLon = 0.0;
+  static bool     haveLast = false;
+
+  if (!g_logReady || !g_gps.hasFix) return;
+  if (now - lastTrackMs < TRACK_INTERVAL_MS) return;
+
+  if (haveLast && metresBetween(lastLat, lastLon, g_gps.lat, g_gps.lon) < TRACK_MIN_MOVE_M)
+  {
+    lastTrackMs = now;      // still parked — re-arm without writing a row
+    return;
+  }
+
+  storage_append_mark("#TRK", g_gps.lat, g_gps.lon, g_gps.utc, g_gps.sats, g_gps.hdop);
+  lastLat = g_gps.lat;
+  lastLon = g_gps.lon;
+  haveLast = true;
+  lastTrackMs = now;
+}
+
 // Periodic table checkpoint so re-sighting count growth survives a power cut
 // (new unique devices are saved immediately in handleDet).
 static void tableSaveTick(uint32_t now)
@@ -452,6 +502,7 @@ void loop()
   ui_tick(now);         // refresh LVGL labels / LIVE list from global state
   serialCmdTick();      // USB-serial console (t=status, d=dump CSV)
   tableSaveTick(now);   // periodic device-table snapshot to QSPI
+  trackTick(now);       // breadcrumb position row (proves the detector was alive)
 
   lv_timer_handler();   // LVGL rendering + input (Arduino_H7_Video drives the tick)
 

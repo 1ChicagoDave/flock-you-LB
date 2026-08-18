@@ -103,6 +103,22 @@ bool storage_init()
   return true;
 }
 
+bool storage_append_mark(const char *tag, double lat, double lon,
+                         uint32_t utc, uint32_t sats, double hdop)
+{
+  if (!s_ready || !s_log) return false;
+
+  // Same column count as a detection row; rssi/channel are 0 and method="mark".
+  fprintf(s_log, "%s,mark,0,0,%.6f,%.6f,%lu,%lu,%.2f,\"\"\n",
+          tag ? tag : "#?", lat, lon,
+          (unsigned long)utc, (unsigned long)sats, hdop);
+
+  fflush(s_log);
+  fclose(s_log);                       // commit (see storage_append_event)
+  s_log = fopen(LOG_PATH, "a");
+  return (s_log != nullptr);
+}
+
 // ---- Device-table snapshot (survives reboot so hit counts persist) ----------
 // Binary blob at /fs/fy_table.bin: header + raw DeviceEntry array.  recSize guards
 // against a struct-layout change (a mismatched file is ignored, starts fresh).
