@@ -46,6 +46,9 @@
 // Hardware IWDG timeout. Loop normally cycles in ~5 ms, so this only fires on a
 // genuine hang (e.g. a display flush that never returns).
 #define WATCHDOG_MS    8000
+// Software hang detector. Must fire BEFORE the hardware watchdog so it has time
+// to write the #HANG marker before the board resets.
+#define HANG_DETECT_MS 4000
 
 // ---- Link liveness ----------------------------------------------------------
 #define LINK_ALIVE_MS  6000     // ESP32 "alive" if a status arrived < this ago
@@ -64,8 +67,12 @@
 // actually moved) plus a #BOOT row each startup. This makes a quiet stretch
 // PROVABLE: you can see the detector was alive and where it was, so "no cameras
 // heard here" is distinguishable from "the log just stopped".
-#define TRACK_INTERVAL_MS      60000UL  // breadcrumb cadence
-#define TRACK_MIN_MOVE_M       25.0     // skip the breadcrumb if parked
+// 30 s: at highway speed a 60 s cadence leaves ~1.2 km gaps between points,
+// which is too coarse to tell whether you actually passed a given camera.
+#define TRACK_INTERVAL_MS      30000UL  // breadcrumb cadence
+// 50 m: GPS jitter on a marginal fix exceeded the old 25 m threshold and wrote
+// breadcrumbs while parked (24 of them in one stationary session).
+#define TRACK_MIN_MOVE_M       50.0     // skip the breadcrumb if parked
 
 // ---- Audio re-alert ---------------------------------------------------------
 // A known camera goes silent forever once it's in the persisted table, which

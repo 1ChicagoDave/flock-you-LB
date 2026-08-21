@@ -74,7 +74,15 @@
 #define CHANNEL_DWELL_MS 350
 #define SINGLE_CHANNEL 1
 
-static const uint8_t customChannels[] = {1, 6, 11};
+// Weighted hop table. Cameras are strongly channel-loyal and 3 days of field
+// data put 56% of detections on ch 1, 35% on ch 11 and only 8% on ch 6 (a single
+// camera). An even 1/6/11 rotation therefore spent a third of the airtime on the
+// least productive channel. Repeating 1 and 11 shifts the dwell split from
+// 33/33/33 to 40/40/20, so a sporadic transmitter on ch 1 or 11 is ~1.2x more
+// likely to be heard, while ch 6 keeps real coverage. Cameras transmit in short
+// bursts (LTE backhaul, WiFi only chatters occasionally), so time-on-channel is
+// the dominant factor in whether a pass produces a hit.
+static const uint8_t customChannels[] = {1, 11, 1, 11, 6};
 static const size_t customChannelCount = sizeof(customChannels) / sizeof(customChannels[0]);
 
 static const uint8_t fullHopChannels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};

@@ -29,7 +29,10 @@ void storage_dump_csv();
 // same 10-column schema so the CSV stays machine-readable; `tag` goes in the mac
 // column and always starts with '#' (e.g. "#BOOT", "#TRK") so analysis tools can
 // filter marker rows out with a single startswith('#') test.
-bool storage_append_mark(const char *tag, double lat, double lon,
+// `kind` lands in the method column: "track" for a breadcrumb, or the reset
+// cause ("power", "WATCHDOG", ...) for a #BOOT row, so a log read back later
+// shows WHY each session started.
+bool storage_append_mark(const char *tag, const char *kind, double lat, double lon,
                          uint32_t utc, uint32_t sats, double hdop);
 
 // Device-table snapshot so hit counts survive a reboot/power cycle.

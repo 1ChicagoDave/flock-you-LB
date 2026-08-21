@@ -109,6 +109,20 @@ static bool   sessionSeen[MAX_DEVICES] = { false };  // per-device "seen this se
 // Index-aligned with g_dev (entries are only ever appended, never removed).
 bool          g_devNew[MAX_DEVICES] = { false };
 
+// ---- hang detection ---------------------------------------------------------
+// Hardware reset-cause reporting is unavailable on this board: RCC->RSR reads 0
+// after a confirmed watchdog reset (the bootloader clears it), and an RTC backup
+// register doesn't survive either. Both were tried and verified useless.
+//
+// Instead a high-priority RTOS thread watches the main loop. If loop() stops
+// updating its liveness stamp, the UI has wedged — the thread writes a #HANG
+// marker (with position/time) to the log and reboots. A "#HANG" row immediately
+// followed by "#BOOT" is then unambiguous proof of a hang, versus a bare "#BOOT"
+// which is an ordinary power/ignition cycle. The 8 s hardware IWDG stays as the
+// backstop for the case where even this thread can't run.
+static volatile uint32_t g_lastLoopMs = 0;
+static rtos::Thread      s_hangWatch(osPriorityHigh, 4096, nullptr, "hangwatch");
+
 // ---- LED one-shot flash ----
 static uint32_t ledOffAt = 0;
 
@@ -412,7 +426,7 @@ void setup()
   // position is usually blank — the row's value is marking where one power-on
   // ends and the next begins when reading the log back.
   if (g_logReady)
-    storage_append_mark("#BOOT", g_gps.hasFix ? g_gps.lat : 0.0,
+    storage_append_mark("#BOOT", "boot", g_gps.hasFix ? g_gps.lat : 0.0,
                         g_gps.hasFix ? g_gps.lon : 0.0,
                         g_gps.hasFix ? g_gps.utc : 0, g_gps.sats, g_gps.hdop);
 
@@ -424,6 +438,11 @@ void setup()
   // Safe to lose a reboot now: the CSV is committed per row and the device table
   // is reloaded from /fs/fy_table.bin on boot, so counts and log survive.
   mbed::Watchdog::get_instance().start(WATCHDOG_MS);
+
+  // Software hang detector — fires before the hardware IWDG so it can record
+  // WHY the board rebooted (see hangWatchFn).
+  g_lastLoopMs = millis();
+  s_hangWatch.start(hangWatchFn);
 }
 
 // Simple USB-serial console:  t = status,  d = dump the CSV log.
@@ -454,6 +473,47 @@ static void serialCmdTick()
   {
     storage_dump_csv();
   }
+  else if (c == 'W')
+  {
+    // Diagnostic: deliberately wedge the loop so the watchdog fires. Used to
+    // prove the reset-cause plumbing actually reports WATCHDOG (vs "unknown"),
+    // so a mid-drive reboot in the log can be read as "it hung" or "it lost
+    // power". Uppercase only — hard to hit by accident.
+    Serial.println("[giga] hanging on purpose; watchdog should reset in ~8s...");
+    Serial.flush();
+    for (;;) { /* no kick -> IWDG expires */ }
+  }
+}
+
+// Why did the board start?  Distinguishes a normal ignition/power cycle from a
+// WATCHDOG reset — i.e. tells us whether the UI is still hanging and silently
+// self-recovering.  Recorded in the #BOOT row of the log.
+// mbed::ResetReason::get() returns UNKNOWN on this board even after a verified
+// watchdog reset, so read the STM32H7 reset-status register ourselves. Captured
+// at the very top of setup() (before anything can clear it) and then cleared via
+// RMVF so the NEXT boot reports its own cause instead of a stale accumulation.
+// Watches main-loop liveness; on a stall, records it and reboots (see the note
+// on the thread declaration for why this exists instead of a reset-cause read).
+static void hangWatchFn()
+{
+  for (;;)
+  {
+    rtos::ThisThread::sleep_for(500);
+    uint32_t last = g_lastLoopMs;
+    if (last == 0) continue;                       // loop hasn't started yet
+    if (millis() - last < HANG_DETECT_MS) continue;
+
+    // Main loop is wedged. It is not touching the filesystem while stuck in the
+    // display driver, and mbed's FATFileSystem takes its own lock, so recording
+    // the event here is safe.
+    if (g_logReady)
+      storage_append_mark("#HANG", "ui-stall",
+                          g_gps.hasFix ? g_gps.lat : 0.0,
+                          g_gps.hasFix ? g_gps.lon : 0.0,
+                          g_gps.hasFix ? g_gps.utc : 0,
+                          g_gps.sats, g_gps.hdop);
+    NVIC_SystemReset();
+  }
 }
 
 // Breadcrumb track: one position row per TRACK_INTERVAL_MS while we have a fix
@@ -474,7 +534,7 @@ static void trackTick(uint32_t now)
     return;
   }
 
-  storage_append_mark("#TRK", g_gps.lat, g_gps.lon, g_gps.utc, g_gps.sats, g_gps.hdop);
+  storage_append_mark("#TRK", "track", g_gps.lat, g_gps.lon, g_gps.utc, g_gps.sats, g_gps.hdop);
   lastLat = g_gps.lat;
   lastLon = g_gps.lon;
   haveLast = true;
@@ -495,6 +555,7 @@ static void tableSaveTick(uint32_t now)
 void loop()
 {
   uint32_t now = millis();
+  g_lastLoopMs = now;   // liveness stamp for the hang detector
 
   pollEsp32();          // parse ESP32 detection/status JSON
   pollGps();            // parse NMEA, refresh fix state

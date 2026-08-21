@@ -103,14 +103,15 @@ bool storage_init()
   return true;
 }
 
-bool storage_append_mark(const char *tag, double lat, double lon,
+bool storage_append_mark(const char *tag, const char *kind, double lat, double lon,
                          uint32_t utc, uint32_t sats, double hdop)
 {
   if (!s_ready || !s_log) return false;
 
-  // Same column count as a detection row; rssi/channel are 0 and method="mark".
-  fprintf(s_log, "%s,mark,0,0,%.6f,%.6f,%lu,%lu,%.2f,\"\"\n",
-          tag ? tag : "#?", lat, lon,
+  // Same column count as a detection row; rssi/channel are 0 and the method
+  // column carries `kind` (breadcrumb type or reset cause).
+  fprintf(s_log, "%s,%s,0,0,%.6f,%.6f,%lu,%lu,%.2f,\"\"\n",
+          tag ? tag : "#?", kind ? kind : "mark", lat, lon,
           (unsigned long)utc, (unsigned long)sats, hdop);
 
   fflush(s_log);
