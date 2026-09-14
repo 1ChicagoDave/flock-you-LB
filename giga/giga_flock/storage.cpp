@@ -123,29 +123,56 @@ bool storage_append_mark(const char *tag, const char *kind, double lat, double l
 // ---- Device-table snapshot (survives reboot so hit counts persist) ----------
 // Binary blob at /fs/fy_table.bin: header + raw DeviceEntry array.  recSize guards
 // against a struct-layout change (a mismatched file is ignored, starts fresh).
+//
+// WRITTEN ATOMICALLY.  The old code opened SNAP_PATH with "wb", which truncates
+// the file the instant it opens — so losing power mid-save (ignition off at the
+// wrong moment) left a truncated snapshot, the next boot failed to load it, and
+// the counts silently restarted at zero.  That happened in the field ~2026-09-10.
+// Now we write a temp file, commit it, and only then swap it into place, so an
+// interruption at ANY point leaves at least one loadable snapshot:
+//   during temp write        -> SNAP_PATH still intact
+//   after temp, before swap  -> SNAP_PATH still intact
+//   between remove + rename  -> SNAP_TMP is valid; load falls back to it
 #define SNAP_PATH  "/fs/fy_table.bin"
+#define SNAP_TMP   "/fs/fy_table.tmp"
 struct SnapHeader { char magic[4]; uint16_t ver; uint16_t recSize; uint32_t count; uint32_t totalEvents; };
 
 void storage_save_table()
 {
   if (!s_ready) return;
-  FILE *f = fopen(SNAP_PATH, "wb");
+
+  FILE *f = fopen(SNAP_TMP, "wb");
   if (!f) return;
+
   SnapHeader h;
   memcpy(h.magic, "FYG1", 4);
   h.ver = 1;
   h.recSize = (uint16_t)sizeof(DeviceEntry);
   h.count = (uint32_t)g_devCount;
   h.totalEvents = g_totalEvents;
-  fwrite(&h, sizeof(h), 1, f);
-  if (g_devCount > 0) fwrite(g_dev, sizeof(DeviceEntry), g_devCount, f);
-  fclose(f);                    // close = commit to flash
+
+  bool ok = (fwrite(&h, sizeof(h), 1, f) == 1);
+  if (ok && g_devCount > 0)
+    ok = (fwrite(g_dev, sizeof(DeviceEntry), g_devCount, f) == (size_t)g_devCount);
+  fflush(f);
+  if (fclose(f) != 0) ok = false;          // close = commit to flash
+
+  if (!ok)
+  {
+    remove(SNAP_TMP);                      // keep the previous good snapshot
+    return;
+  }
+
+  // Swap into place.  If the rename fails the temp file is still a complete
+  // snapshot and storage_load_table() will fall back to it.
+  remove(SNAP_PATH);
+  rename(SNAP_TMP, SNAP_PATH);
 }
 
-bool storage_load_table()
+// Load one snapshot file.  Returns false if absent, truncated or mismatched.
+static bool loadSnapshotFrom(const char *path)
 {
-  if (!s_ready) return false;
-  FILE *f = fopen(SNAP_PATH, "rb");
+  FILE *f = fopen(path, "rb");
   if (!f) return false;
   SnapHeader h;
   if (fread(&h, sizeof(h), 1, f) != 1 ||
@@ -158,6 +185,7 @@ bool storage_load_table()
   }
   size_t n = fread(g_dev, sizeof(DeviceEntry), h.count, f);
   fclose(f);
+  if (n == 0) return false;
   g_devCount    = (int)n;
   g_totalEvents = h.totalEvents;
 
@@ -170,7 +198,20 @@ bool storage_load_table()
     g_dev[i].lastSeenMs  = 0;
     g_dev[i].lastEventMs = 0;
   }
-  return g_devCount > 0;
+  return true;
+}
+
+bool storage_load_table()
+{
+  if (!s_ready) return false;
+  if (loadSnapshotFrom(SNAP_PATH)) return true;
+  // Primary missing/corrupt: recover from an interrupted save.
+  if (loadSnapshotFrom(SNAP_TMP))
+  {
+    Serial.println("[giga] snapshot recovered from interrupted save");
+    return true;
+  }
+  return false;
 }
 
 void storage_dump_csv()
