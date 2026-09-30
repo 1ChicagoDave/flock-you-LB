@@ -35,6 +35,13 @@ void storage_dump_csv();
 bool storage_append_mark(const char *tag, const char *kind, double lat, double lon,
                          uint32_t utc, uint32_t sats, double hdop);
 
+// Append a Strength mark from the NAV screen.  Same 10-column schema:
+//   mac      = "#MARK"        method  = "strength"
+//   rssi     = strength 1..5  channel = heading deg (0..359), or -1 if unknown
+//   lat/lon/utc/sats/hdop as usual; ssid carries a readable "S3 hdg 127" note.
+bool storage_append_strength(int strength, int headingDeg, double lat, double lon,
+                             uint32_t utc, uint32_t sats, double hdop);
+
 // Device-table snapshot so hit counts survive a reboot/power cycle.
 // save writes /fs/fy_table.bin; load restores g_dev / g_devCount / g_totalEvents.
 void storage_save_table();

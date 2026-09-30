@@ -120,6 +120,19 @@ bool storage_append_mark(const char *tag, const char *kind, double lat, double l
   return (s_log != nullptr);
 }
 
+bool storage_append_strength(int strength, int headingDeg, double lat, double lon,
+                             uint32_t utc, uint32_t sats, double hdop)
+{
+  if (!s_ready || !s_log) return false;
+  fprintf(s_log, "#MARK,strength,%d,%d,%.6f,%.6f,%lu,%lu,%.2f,\"S%d hdg %d\"\n",
+          strength, headingDeg, lat, lon,
+          (unsigned long)utc, (unsigned long)sats, hdop, strength, headingDeg);
+  fflush(s_log);
+  fclose(s_log);                       // commit (see storage_append_event)
+  s_log = fopen(LOG_PATH, "a");
+  return (s_log != nullptr);
+}
+
 // ---- Device-table snapshot (survives reboot so hit counts persist) ----------
 // Binary blob at /fs/fy_table.bin: header + raw DeviceEntry array.  recSize guards
 // against a struct-layout change (a mismatched file is ignored, starts fresh).

@@ -62,3 +62,10 @@ void audio_boot()
   delay(30);
   playNote(2200.0f, 170);
 }
+
+// NAV Strength button confirmation: one short blip, clearly different from the
+// two-note detection chirp so the two are never confused while driving.
+void audio_tick()
+{
+  playNote(1500.0f, 45);
+}

@@ -12,3 +12,6 @@ void audio_chirp_new();
 
 // Optional startup blip so you know the speaker is wired.
 void audio_boot();
+
+// Short single blip — tap confirmation for the NAV Strength buttons.
+void audio_tick();

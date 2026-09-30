@@ -377,6 +377,13 @@ static void pollGps()
     g_gps.lon  = gps.location.lng();
     g_gps.hdop = gps.hdop.isValid() ? (gps.hdop.value() / 100.0) : 0.0; // value()=HDOP*100
     g_gps.sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    // Heading for the NAV compass.  Course-over-ground is only meaningful when
+    // moving; parked, it wanders randomly, so gate it on speed.
+    g_gps.speedMps    = gps.speed.isValid()  ? gps.speed.mps()  : 0.0;
+    g_gps.course      = gps.course.isValid() ? gps.course.deg() : 0.0;
+    g_gps.courseValid = gps.course.isValid() && gps.speed.isValid() &&
+                        gps.course.age() < GPS_STALE_MS &&
+                        g_gps.speedMps >= NAV_MIN_SPEED_MPS;
     if (gps.date.isValid() && gps.time.isValid() && gps.date.age() < GPS_STALE_MS)
     {
       long days = daysFromCivil(gps.date.year(), gps.date.month(), gps.date.day());
@@ -388,6 +395,7 @@ static void pollGps()
   else
   {
     g_gps.hasFix = false;   // detections still recorded, just without geodata
+    g_gps.courseValid = false;
   }
 }
 

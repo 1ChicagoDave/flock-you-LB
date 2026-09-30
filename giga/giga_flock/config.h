@@ -42,6 +42,16 @@
 #define UI_TICK_MS     200      // label refresh cadence
 #define LIVE_REBUILD_MS 400     // min interval between LIVE list rebuilds
 
+// ---- NAV tab: bearing / distance to a fixed target + Strength marks --------
+// Target = 35.92963 N, 84.30987 W.  The compass is heading-up (straight up on
+// the screen = direction of travel) using GPS course-over-ground.  Below
+// NAV_MIN_SPEED_MPS the course is noise, so we fall back to north-up and say so.
+#define NAV_TARGET_LAT      35.92963
+#define NAV_TARGET_LON     -84.30987
+#define NAV_MIN_SPEED_MPS   1.5      // ~3.4 mph
+#define NAV_TICK_MS         500      // readout / compass refresh cadence
+#define NAV_SAVED_MS        1500     // how long the "SAVED S3" confirmation shows
+
 // ---- Watchdog ---------------------------------------------------------------
 // Hardware IWDG timeout. Loop normally cycles in ~5 ms, so this only fires on a
 // genuine hang (e.g. a display flush that never returns).

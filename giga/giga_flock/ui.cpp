@@ -35,6 +35,9 @@
 
 #include "lvgl.h"
 #include "Arduino_GigaDisplayTouch.h"
+#include "storage.h"   // NAV Strength marks -> CSV
+#include "audio.h"     // tap confirmation blip
+#include <math.h>
 
 // The touch object is created in the .ino; we just reference it.
 extern Arduino_GigaDisplayTouch TouchDetector;
@@ -283,6 +286,290 @@ static void buildHunter()
   lv_obj_center(hnRssiLbl);
 }
 
+
+// ============================================================================
+// NAV tab — bearing / distance to a fixed target on a heading-up compass, plus
+// five "Strength" buttons that drop a #MARK row into the detection log.
+//   * Straight up on the screen = direction of travel (GPS course).  The arrow
+//     is (bearing - heading) and the N/E/S/W letters rotate to stay true, so
+//     the picture reads like a turn-by-turn compass in a car.
+//   * Parked (course invalid) we fall back to north-up and say so, rather than
+//     spinning the rose on GPS noise.
+//   * Repaints are tiny and gated to NAV_TICK_MS, and the arrow/letters only
+//     move when the angle actually changes — the display driver hangs on large
+//     frequent repaints (see the overlay/radar history), so keep it that way.
+// ============================================================================
+#define NAV_TAB_IDX     4
+#define NAV_PAD         370      // square holding ring + cardinal letters
+#define NAV_RING_D      300      // compass circle diameter
+#define NAV_LBL_R       160      // cardinal-letter radius (just outside the ring)
+#define NAV_ARROW_TIP   105      // arrow tip distance from center
+#define NAV_ARROW_TAIL  70       // arrow tail distance from center
+#define NAV_ARROW_HEAD  34       // arrowhead length
+#define NAV_ARROW_HALF  22       // arrowhead half-width
+static const double NAV_D2R = 0.017453292519943295;
+
+static lv_obj_t *tabNav;
+static lv_obj_t *navPad, *navArrow, *navCard[4];
+static lv_obj_t *navDist, *navBrg, *navHdg, *navMode, *navCount, *navSaved;
+static lv_point_precise_t navArrowPts[5];
+static uint32_t lastNavMs = 0, navSavedUntil = 0;
+static int      navMarkCount = 0;
+static int      navLastArrowDeg = -999, navLastHdgDeg = -999;
+static const char *NAV_CARD_TXT[4] = { "N", "E", "S", "W" };
+
+// Great-circle distance, metres (haversine).
+static double navDistanceM(double la1, double lo1, double la2, double lo2)
+{
+  const double R = 6371000.0;
+  double dLat = (la2 - la1) * NAV_D2R, dLon = (lo2 - lo1) * NAV_D2R;
+  double a = sin(dLat / 2) * sin(dLat / 2) +
+             cos(la1 * NAV_D2R) * cos(la2 * NAV_D2R) * sin(dLon / 2) * sin(dLon / 2);
+  return 2.0 * R * atan2(sqrt(a), sqrt(1.0 - a));
+}
+
+// Initial bearing from point 1 to point 2, degrees true 0..360.
+static double navBearingDeg(double la1, double lo1, double la2, double lo2)
+{
+  double p1 = la1 * NAV_D2R, p2 = la2 * NAV_D2R, dl = (lo2 - lo1) * NAV_D2R;
+  double y = sin(dl) * cos(p2);
+  double x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl);
+  double b = atan2(y, x) / NAV_D2R;
+  if (b < 0) b += 360.0;
+  return b;
+}
+
+static const char *navCardinal8(double deg)
+{
+  static const char *n[8] = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+  int i = (int)((deg + 22.5) / 45.0) % 8;
+  if (i < 0) i += 8;
+  return n[i];
+}
+
+static void navFmtDist(char *buf, size_t n, double m)
+{
+  if      (m < 304.8)   snprintf(buf, n, "%d ft",   (int)(m * 3.28084 + 0.5));
+  else if (m < 16093.4) snprintf(buf, n, "%.2f mi", m / 1609.344);
+  else                  snprintf(buf, n, "%.1f mi", m / 1609.344);
+}
+
+// Arrow as a 5-point polyline: tail -> tip -> barb -> tip -> barb.
+// deg is a SCREEN angle: 0 = straight up, clockwise positive.
+static void navSetArrow(int deg)
+{
+  const double a  = deg * NAV_D2R;
+  const double dx = sin(a), dy = -cos(a);     // toward the tip
+  const double px = cos(a), py =  sin(a);     // perpendicular
+  const double cx = NAV_PAD / 2.0, cy = NAV_PAD / 2.0;
+  const double tipx = cx + dx * NAV_ARROW_TIP,   tipy = cy + dy * NAV_ARROW_TIP;
+  const double bx   = tipx - dx * NAV_ARROW_HEAD, by = tipy - dy * NAV_ARROW_HEAD;
+  navArrowPts[0].x = (int32_t)(cx - dx * NAV_ARROW_TAIL); navArrowPts[0].y = (int32_t)(cy - dy * NAV_ARROW_TAIL);
+  navArrowPts[1].x = (int32_t)tipx;                       navArrowPts[1].y = (int32_t)tipy;
+  navArrowPts[2].x = (int32_t)(bx + px * NAV_ARROW_HALF); navArrowPts[2].y = (int32_t)(by + py * NAV_ARROW_HALF);
+  navArrowPts[3].x = (int32_t)tipx;                       navArrowPts[3].y = (int32_t)tipy;
+  navArrowPts[4].x = (int32_t)(bx - px * NAV_ARROW_HALF); navArrowPts[4].y = (int32_t)(by - py * NAV_ARROW_HALF);
+  lv_line_set_points(navArrow, navArrowPts, 5);
+}
+
+// Place N/E/S/W around the ring, rotated so they stay TRUE when heading-up.
+static void navSetCardinals(int hdgDeg)
+{
+  for (int i = 0; i < 4; i++)
+  {
+    double a = (i * 90 - hdgDeg) * NAV_D2R;
+    lv_obj_align(navCard[i], LV_ALIGN_CENTER,
+                 (int32_t)( sin(a) * NAV_LBL_R), (int32_t)(-cos(a) * NAV_LBL_R));
+  }
+}
+
+// Strength button tap: log it, blip, confirm on screen.
+static void nav_strength_cb(lv_event_t *e)
+{
+  int s   = (int)(intptr_t)lv_event_get_user_data(e);
+  int hdg = g_gps.courseValid ? (int)lround(g_gps.course) : -1;
+  bool ok = storage_append_strength(s, hdg,
+                                    g_gps.hasFix ? g_gps.lat : 0.0,
+                                    g_gps.hasFix ? g_gps.lon : 0.0,
+                                    g_gps.hasFix ? g_gps.utc : 0,
+                                    g_gps.sats, g_gps.hdop);
+  audio_tick();
+  navMarkCount++;
+  lv_label_set_text_fmt(navSaved, ok ? "SAVED  S%d" : "S%d  (log off)", s);
+  lv_obj_set_style_text_color(navSaved, hx(ok ? COL_OK : COL_BAD), 0);
+  navSavedUntil = millis() + NAV_SAVED_MS;
+  lv_label_set_text_fmt(navCount, "marks this drive: %d", navMarkCount);
+}
+
+static void buildNav()
+{
+  lv_obj_t *page = lv_obj_create(tabNav);
+  lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_style_bg_color(page, hx(COL_BG), 0);
+  lv_obj_set_style_border_width(page, 0, 0);
+  lv_obj_set_style_pad_all(page, 6, 0);
+  lv_obj_set_style_pad_column(page, 10, 0);
+  lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(page, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  // ---- compass (left) ----
+  navPad = lv_obj_create(page);
+  lv_obj_remove_style_all(navPad);
+  lv_obj_set_size(navPad, NAV_PAD, NAV_PAD);
+  lv_obj_remove_flag(navPad, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *ring = lv_obj_create(navPad);
+  lv_obj_remove_style_all(ring);
+  lv_obj_set_size(ring, NAV_RING_D, NAV_RING_D);
+  lv_obj_align(ring, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_color(ring, hx(COL_DIM), 0);
+  lv_obj_set_style_border_width(ring, 2, 0);
+
+  for (int i = 0; i < 4; i++)
+  {
+    navCard[i] = lv_label_create(navPad);
+    lv_label_set_text(navCard[i], NAV_CARD_TXT[i]);
+    lv_obj_set_style_text_font(navCard[i], &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(navCard[i], hx(i == 0 ? COL_BAD : COL_DIM), 0);  // N red, like a real rose
+  }
+  navSetCardinals(0);
+
+  navArrow = lv_line_create(navPad);
+  lv_obj_remove_style_all(navArrow);
+  lv_obj_set_pos(navArrow, 0, 0);
+  lv_obj_set_size(navArrow, NAV_PAD, NAV_PAD);
+  lv_obj_set_style_line_width(navArrow, 8, 0);
+  lv_obj_set_style_line_color(navArrow, hx(COL_OK), 0);
+  lv_obj_set_style_line_rounded(navArrow, true, 0);
+  navSetArrow(0);
+  lv_obj_add_flag(navArrow, LV_OBJ_FLAG_HIDDEN);       // shown once we have a fix
+
+  lv_obj_t *dot = lv_obj_create(navPad);
+  lv_obj_remove_style_all(dot);
+  lv_obj_set_size(dot, 10, 10);
+  lv_obj_align(dot, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(dot, hx(COL_TEXT), 0);
+
+  // ---- readouts (middle) ----
+  lv_obj_t *col = lv_obj_create(page);
+  lv_obj_remove_style_all(col);
+  lv_obj_set_flex_grow(col, 1);
+  lv_obj_set_height(col, LV_PCT(100));
+  lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(col, 6, 0);
+
+  lv_obj_t *t = lv_label_create(col);
+  lv_label_set_text(t, "TARGET");
+  lv_obj_set_style_text_font(t, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(t, hx(COL_DIM), 0);
+
+  navDist = lv_label_create(col);
+  lv_label_set_text(navDist, "--");
+  lv_obj_set_style_text_font(navDist, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(navDist, hx(COL_TEXT), 0);
+
+  navBrg = lv_label_create(col);
+  lv_label_set_text(navBrg, "--");
+  lv_obj_set_style_text_font(navBrg, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(navBrg, hx(COL_TEXT), 0);
+
+  navHdg = lv_label_create(col);
+  lv_label_set_text(navHdg, "HDG --");
+  lv_obj_set_style_text_font(navHdg, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(navHdg, hx(COL_DIM), 0);
+
+  navMode = lv_label_create(col);
+  lv_label_set_text(navMode, "north-up");
+  lv_obj_set_style_text_font(navMode, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(navMode, hx(COL_DIM), 0);
+
+  navSaved = lv_label_create(col);          // always present (no layout jump), text toggles
+  lv_label_set_text(navSaved, "");
+  lv_obj_set_style_text_font(navSaved, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(navSaved, hx(COL_OK), 0);
+
+  navCount = lv_label_create(col);
+  lv_label_set_text(navCount, "marks this drive: 0");
+  lv_obj_set_style_text_font(navCount, &lv_font_montserrat_14, 0);
+  lv_obj_set_style_text_color(navCount, hx(COL_DIM), 0);
+
+  // ---- Strength buttons (right): 5 on top, 1 on the bottom ----
+  lv_obj_t *btns = lv_obj_create(page);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_size(btns, 112, LV_PCT(100));
+  lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(btns, 8, 0);
+  for (int sv = 5; sv >= 1; sv--)
+  {
+    lv_obj_t *b = lv_button_create(btns);
+    lv_obj_set_size(b, 104, 64);
+    lv_obj_set_style_bg_color(b, hx(0x1E2A3A), 0);
+    lv_obj_set_style_bg_color(b, hx(COL_OK), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(b, 10, 0);
+    lv_obj_add_event_cb(b, nav_strength_cb, LV_EVENT_CLICKED, (void *)(intptr_t)sv);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text_fmt(l, "%d", sv);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(l, hx(COL_TEXT), 0);
+    lv_obj_center(l);
+  }
+}
+
+// Refresh the NAV readouts; only while the tab is showing, and only moves the
+// arrow/letters when the angle actually changed.
+static void nav_tick(uint32_t now)
+{
+  if (lv_tabview_get_tab_active(tabview) != NAV_TAB_IDX) return;
+  if (now - lastNavMs < NAV_TICK_MS) return;
+  lastNavMs = now;
+
+  if (navSavedUntil && now >= navSavedUntil) { lv_label_set_text(navSaved, ""); navSavedUntil = 0; }
+
+  char buf[48];
+  if (!g_gps.hasFix)
+  {
+    lv_label_set_text(navDist, "no fix");
+    lv_label_set_text(navBrg,  "--");
+    lv_label_set_text(navHdg,  "HDG --");
+    lv_obj_add_flag(navArrow, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+
+  double dist = navDistanceM(g_gps.lat, g_gps.lon, NAV_TARGET_LAT, NAV_TARGET_LON);
+  double brg  = navBearingDeg(g_gps.lat, g_gps.lon, NAV_TARGET_LAT, NAV_TARGET_LON);
+  navFmtDist(buf, sizeof(buf), dist);
+  lv_label_set_text(navDist, buf);
+  snprintf(buf, sizeof(buf), "%s  %03d°", navCardinal8(brg), (int)lround(brg) % 360);
+  lv_label_set_text(navBrg, buf);
+
+  int hdg = 0;
+  if (g_gps.courseValid)
+  {
+    hdg = (int)lround(g_gps.course) % 360;
+    snprintf(buf, sizeof(buf), "HDG %03d°  %s", hdg, navCardinal8(g_gps.course));
+    lv_label_set_text(navHdg, buf);
+    lv_label_set_text(navMode, "heading-up");
+  }
+  else
+  {
+    lv_label_set_text(navHdg,  "HDG --  (stopped)");
+    lv_label_set_text(navMode, "north-up");
+  }
+
+  int arrowDeg = (((int)lround(brg) - hdg) % 360 + 360) % 360;
+  if (arrowDeg != navLastArrowDeg) { navSetArrow(arrowDeg);  navLastArrowDeg = arrowDeg; }
+  if (hdg      != navLastHdgDeg)   { navSetCardinals(hdg);   navLastHdgDeg   = hdg; }
+  lv_obj_remove_flag(navArrow, LV_OBJ_FLAG_HIDDEN);
+}
+
 void ui_init()
 {
   // Global dark background on the active screen.
@@ -299,11 +586,13 @@ void ui_init()
   tabStats  = lv_tabview_add_tab(tabview, "STATS");
   tabAlert  = lv_tabview_add_tab(tabview, "ALERT");
   tabHunter = lv_tabview_add_tab(tabview, "HUNTER");
+  tabNav    = lv_tabview_add_tab(tabview, "NAV");
 
   buildLive();
   buildStats();
   buildAlert();
   buildHunter();
+  buildNav();
 
   // Always-visible status dots on the top layer (render above every tab). Made
   // non-clickable so taps fall through to the tab bar underneath.
@@ -534,4 +823,6 @@ void ui_tick(uint32_t now)
     g_uiDirty = false;
     rebuildLiveList(now);
   }
+
+  nav_tick(now);
 }

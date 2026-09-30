@@ -52,6 +52,9 @@ struct GpsState
   uint32_t utc;            // unix epoch, UTC (0 if unknown)
   uint32_t sats;
   double   hdop;
+  double   course;         // GPS course over ground, degrees true (0..360)
+  double   speedMps;       // GPS ground speed, m/s
+  bool     courseValid;    // course is fresh AND we're moving fast enough to trust it
 };
 
 // ---- Globals (defined in giga_flock.ino) ----
