@@ -30,6 +30,7 @@
 #include "FATFileSystem.h"
 
 #include <stdio.h>
+#include <math.h>
 
 // Internal QSPI flash + its FAT user-data partition (MBR partition 2).
 static mbed::BlockDevice   *s_root = nullptr;
@@ -131,6 +132,59 @@ bool storage_append_strength(int strength, int headingDeg, double lat, double lo
   fclose(s_log);                       // commit (see storage_append_event)
   s_log = fopen(LOG_PATH, "a");
   return (s_log != nullptr);
+}
+
+// ---- Touch calibration -----------------------------------------------------
+// A bad calibration would make the screen unusable, so values are sanity
+// checked on both save and load, and written temp+rename like the snapshot.
+// Serial 'c' deletes it (back to identity) as the rescue path.
+#define TCAL_PATH "/fs/touchcal.bin"
+#define TCAL_TMP  "/fs/touchcal.tmp"
+struct TcalRec { char magic[4]; float sx, ox, sy, oy; };
+
+static bool tcalPlausible(float sx, float ox, float sy, float oy)
+{
+  if (!isfinite(sx) || !isfinite(ox) || !isfinite(sy) || !isfinite(oy)) return false;
+  if (sx < 0.5f || sx > 2.0f || sy < 0.5f || sy > 2.0f) return false;
+  if (fabsf(ox) > 400.0f || fabsf(oy) > 400.0f) return false;
+  return true;
+}
+
+bool storage_save_touchcal(float sx, float ox, float sy, float oy)
+{
+  if (!s_ready || !tcalPlausible(sx, ox, sy, oy)) return false;
+  FILE *f = fopen(TCAL_TMP, "wb");
+  if (!f) return false;
+  TcalRec r; memcpy(r.magic, "FYTC", 4); r.sx = sx; r.ox = ox; r.sy = sy; r.oy = oy;
+  bool ok = (fwrite(&r, sizeof(r), 1, f) == 1);
+  fflush(f);
+  if (fclose(f) != 0) ok = false;
+  if (!ok) { remove(TCAL_TMP); return false; }
+  remove(TCAL_PATH);
+  rename(TCAL_TMP, TCAL_PATH);
+  return true;
+}
+
+bool storage_load_touchcal(float *sx, float *ox, float *sy, float *oy)
+{
+  if (!s_ready) return false;
+  FILE *f = fopen(TCAL_PATH, "rb");
+  if (!f) f = fopen(TCAL_TMP, "rb");           // interrupted save
+  if (!f) return false;
+  TcalRec r;
+  bool ok = (fread(&r, sizeof(r), 1, f) == 1) && memcmp(r.magic, "FYTC", 4) == 0 &&
+            tcalPlausible(r.sx, r.ox, r.sy, r.oy);
+  fclose(f);
+  if (!ok) return false;
+  *sx = r.sx; *ox = r.ox; *sy = r.sy; *oy = r.oy;
+  return true;
+}
+
+void storage_clear_touchcal()
+{
+  if (!s_ready) return;
+  remove(TCAL_PATH);
+  remove(TCAL_TMP);
 }
 
 // ---- Device-table snapshot (survives reboot so hit counts persist) ----------

@@ -42,6 +42,12 @@ bool storage_append_mark(const char *tag, const char *kind, double lat, double l
 bool storage_append_strength(int strength, int headingDeg, double lat, double lon,
                              uint32_t utc, uint32_t sats, double hdop);
 
+// Touch calibration (2-point scale/offset) persisted at /fs/touchcal.bin.
+// save rejects implausible values; load returns false if absent/corrupt.
+bool storage_save_touchcal(float sx, float ox, float sy, float oy);
+bool storage_load_touchcal(float *sx, float *ox, float *sy, float *oy);
+void storage_clear_touchcal();
+
 // Device-table snapshot so hit counts survive a reboot/power cycle.
 // save writes /fs/fy_table.bin; load restores g_dev / g_devCount / g_totalEvents.
 void storage_save_table();

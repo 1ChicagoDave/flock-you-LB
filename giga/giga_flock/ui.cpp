@@ -54,6 +54,26 @@ extern Arduino_GigaDisplayTouch TouchDetector;
 #define PANEL_NATIVE_W  480      // GT911 native width (portrait)
 #define PANEL_NATIVE_H  800      // GT911 native height (portrait)
 
+// ---- touch calibration (2-point scale/offset) ----
+// The GT911 is capacitive, so this is not the resistive-panel kind of
+// calibration; what it fixes is RANGE. If the raw X span tops out short of 799,
+// the right-hand strip of the screen is simply unreachable, which is exactly
+// how "the right side is less reliable" presents. Two corner taps measure the
+// real raw extents and derive screen = raw*s + o.
+static float calSx = 1.0f, calOx = 0.0f, calSy = 1.0f, calOy = 0.0f;
+static bool  touchDbg = false;
+enum { CAL_OFF = 0, CAL_WAIT_TL, CAL_WAIT_BR };
+static int       calMode = CAL_OFF;
+static uint32_t  calArmMs = 0, calMsgUntil = 0;
+static int       calRawX = 0, calRawY = 0, calTLx = 0, calTLy = 0;
+static bool      calDown = false;
+static volatile bool calTapReady = false;
+static lv_obj_t *calRing = nullptr, *calDot = nullptr, *calMsg = nullptr;
+#define CAL_T1_X 40
+#define CAL_T1_Y 40
+#define CAL_T2_X (SCREEN_W - 40)
+#define CAL_T2_Y (SCREEN_H - 40)
+
 // ---- widget handles ----
 static lv_obj_t *tabview;
 static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter;
@@ -99,10 +119,31 @@ static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
   (void)drv;
   GDTpoint_t pts[5];
   uint8_t n = TouchDetector.getTouchPoints(pts);
+
+  // Calibration in progress: capture raw taps and report nothing to LVGL so
+  // whatever is under the finger (tab bar, buttons) does not react.
+  if (calMode != CAL_OFF)
+  {
+    if (n > 0)        { calRawX = pts[0].x; calRawY = pts[0].y; calDown = true; }
+    else if (calDown) { calDown = false; calTapReady = true; }      // release = tap
+    data->state = LV_INDEV_STATE_RELEASED;
+    return;
+  }
+
   if (n > 0)
   {
     int rx = pts[0].x;
     int ry = pts[0].y;
+    if (touchDbg)
+    {
+      static uint32_t lastDbg = 0;
+      uint32_t m = millis();
+      if (m - lastDbg > 150)
+      {
+        lastDbg = m;
+        Serial.print("[touch] raw "); Serial.print(rx); Serial.print(","); Serial.println(ry);
+      }
+    }
     int sx, sy;
 #if TOUCH_SWAP_XY
     sx = ry; sy = rx;
@@ -115,6 +156,9 @@ static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
 #if TOUCH_INV_Y
     sy = (SCREEN_H - 1) - sy;
 #endif
+    // 2-point calibration (identity until the user calibrates).
+    sx = (int)lroundf(sx * calSx + calOx);
+    sy = (int)lroundf(sy * calSy + calOy);
     if (sx < 0) sx = 0; if (sx >= SCREEN_W) sx = SCREEN_W - 1;
     if (sy < 0) sy = 0; if (sy >= SCREEN_H) sy = SCREEN_H - 1;
     data->point.x = sx;
@@ -125,6 +169,116 @@ static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
   {
     data->state = LV_INDEV_STATE_RELEASED;
   }
+}
+
+void ui_set_touchcal(const TouchCal &c)
+{
+  calSx = c.sx; calOx = c.ox; calSy = c.sy; calOy = c.oy;
+}
+
+void ui_touch_debug(bool on) { touchDbg = on; }
+
+static void cal_place_target(int x, int y, const char *msg)
+{
+  lv_obj_set_pos(calRing, x - 16, y - 16);
+  lv_obj_set_pos(calDot,  x - 3,  y - 3);
+  lv_label_set_text(calMsg, msg);
+}
+
+// Start the 2-point calibration: small targets on lv_layer_top (tiny repaints),
+// touches swallowed until done.
+static void cal_begin()
+{
+  if (calMode != CAL_OFF) return;
+  if (calMsg) { lv_obj_delete(calMsg); calMsg = nullptr; }
+
+  calRing = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(calRing);
+  lv_obj_set_size(calRing, 32, 32);
+  lv_obj_set_style_radius(calRing, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_border_color(calRing, hx(COL_OK), 0);
+  lv_obj_set_style_border_width(calRing, 3, 0);
+  lv_obj_remove_flag(calRing, LV_OBJ_FLAG_CLICKABLE);
+
+  calDot = lv_obj_create(lv_layer_top());
+  lv_obj_remove_style_all(calDot);
+  lv_obj_set_size(calDot, 6, 6);
+  lv_obj_set_style_radius(calDot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_opa(calDot, LV_OPA_COVER, 0);
+  lv_obj_set_style_bg_color(calDot, hx(COL_OK), 0);
+  lv_obj_remove_flag(calDot, LV_OBJ_FLAG_CLICKABLE);
+
+  calMsg = lv_label_create(lv_layer_top());
+  lv_obj_set_style_text_font(calMsg, &lv_font_montserrat_28, 0);
+  lv_obj_set_style_text_color(calMsg, hx(COL_TEXT), 0);
+  lv_obj_align(calMsg, LV_ALIGN_CENTER, 0, 0);
+
+  cal_place_target(CAL_T1_X, CAL_T1_Y, "Tap the green circle  (1 of 2)");
+  calDown = false; calTapReady = false;
+  calArmMs = millis() + 500;      // ignore the tap that pressed the button
+  calMode  = CAL_WAIT_TL;
+}
+
+static void cal_finish(const char *msg)
+{
+  if (calRing) { lv_obj_delete(calRing); calRing = nullptr; }
+  if (calDot)  { lv_obj_delete(calDot);  calDot  = nullptr; }
+  lv_label_set_text(calMsg, msg);
+  lv_obj_align(calMsg, LV_ALIGN_CENTER, 0, 0);
+  calMsgUntil = millis() + 2500;  // message lingers, then is deleted in cal_tick
+  calMode = CAL_OFF;
+}
+
+static void cal_tick(uint32_t now)
+{
+  if (calMode == CAL_OFF)
+  {
+    if (calMsg && calMsgUntil && (int32_t)(now - calMsgUntil) >= 0)
+    {
+      lv_obj_delete(calMsg); calMsg = nullptr; calMsgUntil = 0;
+    }
+    return;
+  }
+  if (!calTapReady) return;
+  calTapReady = false;
+  if ((int32_t)(now - calArmMs) < 0) return;
+
+  if (calMode == CAL_WAIT_TL)
+  {
+    calTLx = calRawX; calTLy = calRawY;
+    cal_place_target(CAL_T2_X, CAL_T2_Y, "Tap the green circle  (2 of 2)");
+    calArmMs = now + 400;
+    calMode  = CAL_WAIT_BR;
+    return;
+  }
+
+  // Second tap: derive scale/offset from the two raw points.
+  const int dxr = calRawX - calTLx, dyr = calRawY - calTLy;
+  const int dxs = CAL_T2_X - CAL_T1_X, dys = CAL_T2_Y - CAL_T1_Y;
+  const bool plausible = dxr > dxs * 0.5f && dxr < dxs * 1.6f &&
+                         dyr > dys * 0.5f && dyr < dys * 1.6f;
+  if (!plausible)
+  {
+    Serial.print("[touch] cal rejected: raw span "); Serial.print(dxr); Serial.print("x"); Serial.println(dyr);
+    cal_finish("Calibration failed - try again");
+    return;
+  }
+  const float sx = (float)dxs / dxr, sy = (float)dys / dyr;
+  const float ox = CAL_T1_X - calTLx * sx, oy = CAL_T1_Y - calTLy * sy;
+  calSx = sx; calOx = ox; calSy = sy; calOy = oy;
+  bool saved = storage_save_touchcal(sx, ox, sy, oy);
+  Serial.print("[touch] calibrated: raw TL "); Serial.print(calTLx); Serial.print(","); Serial.print(calTLy);
+  Serial.print("  raw BR "); Serial.print(calRawX); Serial.print(","); Serial.print(calRawY);
+  Serial.print("  -> sx="); Serial.print(sx, 4); Serial.print(" ox="); Serial.print(ox, 1);
+  Serial.print(" sy="); Serial.print(sy, 4); Serial.print(" oy="); Serial.print(oy, 1);
+  Serial.println(saved ? "  (saved)" : "  (NOT saved - log off)");
+  cal_finish(saved ? "Touch calibrated" : "Calibrated (not saved)");
+}
+
+static void stats_cal_cb(lv_event_t *e)
+{
+  (void)e;
+  cal_begin();
 }
 
 static void register_touch()
@@ -190,6 +344,22 @@ static void buildStats()
   stPkts   = makeStatRow(col, "Pkts / uniq");
   stGps    = makeStatRow(col, "GPS");
   stLog    = makeStatRow(col, "Log");
+
+  // Touch calibration entry point. Left-aligned on purpose: the left side of
+  // this panel registers more reliably, and this button has to be hittable
+  // even when the mapping is off.
+  lv_obj_t *cb = lv_button_create(col);
+  lv_obj_set_size(cb, 250, 56);
+  lv_obj_set_style_margin_top(cb, 10, 0);
+  lv_obj_set_style_bg_color(cb, hx(0x1E2A3A), 0);
+  lv_obj_set_style_bg_color(cb, hx(COL_OK), LV_STATE_PRESSED);
+  lv_obj_set_style_radius(cb, 10, 0);
+  lv_obj_add_event_cb(cb, stats_cal_cb, LV_EVENT_CLICKED, NULL);
+  lv_obj_t *cl = lv_label_create(cb);
+  lv_label_set_text(cl, "Calibrate touch");
+  lv_obj_set_style_text_font(cl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(cl, hx(COL_TEXT), 0);
+  lv_obj_center(cl);
 }
 
 static void buildAlert()
@@ -413,7 +583,32 @@ static void buildNav()
   lv_obj_set_flex_flow(page, LV_FLEX_FLOW_ROW);
   lv_obj_set_flex_align(page, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
 
-  // ---- compass (left) ----
+  // ---- Strength buttons (LEFT): 5 on top, 1 on the bottom.  Left side
+  // because that edge of this panel registers more reliably than the right.
+  lv_obj_t *btns = lv_obj_create(page);
+  lv_obj_remove_style_all(btns);
+  lv_obj_set_size(btns, 112, LV_PCT(100));
+  lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(btns, 8, 0);
+  for (int sv = 5; sv >= 1; sv--)
+  {
+    lv_obj_t *b = lv_button_create(btns);
+    lv_obj_set_size(b, 104, 64);
+    lv_obj_set_style_bg_color(b, hx(0x1E2A3A), 0);
+    lv_obj_set_style_bg_color(b, hx(COL_OK), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(b, 10, 0);
+    lv_obj_add_event_cb(b, nav_strength_cb, LV_EVENT_CLICKED, (void *)(intptr_t)sv);
+    lv_obj_t *l = lv_label_create(b);
+    lv_label_set_text_fmt(l, "%d", sv);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(l, hx(COL_TEXT), 0);
+    lv_obj_center(l);
+  }
+
+
+  // ---- compass (middle) ----
   navPad = lv_obj_create(page);
   lv_obj_remove_style_all(navPad);
   lv_obj_set_size(navPad, NAV_PAD, NAV_PAD);
@@ -454,7 +649,7 @@ static void buildNav()
   lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
   lv_obj_set_style_bg_color(dot, hx(COL_TEXT), 0);
 
-  // ---- readouts (middle) ----
+  // ---- readouts (right) ----
   lv_obj_t *col = lv_obj_create(page);
   lv_obj_remove_style_all(col);
   lv_obj_set_flex_grow(col, 1);
@@ -499,28 +694,6 @@ static void buildNav()
   lv_obj_set_style_text_font(navCount, &lv_font_montserrat_14, 0);
   lv_obj_set_style_text_color(navCount, hx(COL_DIM), 0);
 
-  // ---- Strength buttons (right): 5 on top, 1 on the bottom ----
-  lv_obj_t *btns = lv_obj_create(page);
-  lv_obj_remove_style_all(btns);
-  lv_obj_set_size(btns, 112, LV_PCT(100));
-  lv_obj_remove_flag(btns, LV_OBJ_FLAG_SCROLLABLE);
-  lv_obj_set_flex_flow(btns, LV_FLEX_FLOW_COLUMN);
-  lv_obj_set_flex_align(btns, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-  lv_obj_set_style_pad_row(btns, 8, 0);
-  for (int sv = 5; sv >= 1; sv--)
-  {
-    lv_obj_t *b = lv_button_create(btns);
-    lv_obj_set_size(b, 104, 64);
-    lv_obj_set_style_bg_color(b, hx(0x1E2A3A), 0);
-    lv_obj_set_style_bg_color(b, hx(COL_OK), LV_STATE_PRESSED);
-    lv_obj_set_style_radius(b, 10, 0);
-    lv_obj_add_event_cb(b, nav_strength_cb, LV_EVENT_CLICKED, (void *)(intptr_t)sv);
-    lv_obj_t *l = lv_label_create(b);
-    lv_label_set_text_fmt(l, "%d", sv);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_28, 0);
-    lv_obj_set_style_text_color(l, hx(COL_TEXT), 0);
-    lv_obj_center(l);
-  }
 }
 
 // Refresh the NAV readouts; only while the tab is showing, and only moves the
@@ -825,4 +998,5 @@ void ui_tick(uint32_t now)
   }
 
   nav_tick(now);
+  cal_tick(now);
 }

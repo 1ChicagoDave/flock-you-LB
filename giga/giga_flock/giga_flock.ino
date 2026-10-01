@@ -421,6 +421,20 @@ void setup()
   g_logReady = storage_init();
   Serial.println(g_logReady ? "[giga] QSPI log ready" : "[giga] QSPI log DISABLED");
 
+  // Touch calibration from the STATS screen, if one has been saved.
+  {
+    float sx, ox, sy, oy;
+    if (g_logReady && storage_load_touchcal(&sx, &ox, &sy, &oy))
+    {
+      TouchCal c = { sx, ox, sy, oy };
+      ui_set_touchcal(c);
+      Serial.print("[giga] touch cal loaded: sx="); Serial.print(sx, 4);
+      Serial.print(" ox="); Serial.print(ox, 1);
+      Serial.print(" sy="); Serial.print(sy, 4);
+      Serial.print(" oy="); Serial.println(oy, 1);
+    }
+  }
+
   // Reload the persisted device table so hit counts survive a power cycle.
   if (g_logReady && storage_load_table())
   {
@@ -453,7 +467,8 @@ void setup()
   s_hangWatch.start(hangWatchFn);
 }
 
-// Simple USB-serial console:  t = status,  d = dump the CSV log.
+// Simple USB-serial console:  t = status,  d = dump the CSV log,
+// c = clear touch calibration,  x = toggle raw touch echo,  W = test hang.
 static void serialCmdTick()
 {
   if (!Serial.available()) return;
@@ -480,6 +495,22 @@ static void serialCmdTick()
   else if (c == 'd' || c == 'D')
   {
     storage_dump_csv();
+  }
+  else if (c == 'c' || c == 'C')
+  {
+    // Rescue path: wipe a bad touch calibration and go back to identity.
+    storage_clear_touchcal();
+    TouchCal id = { 1.0f, 0.0f, 1.0f, 0.0f };
+    ui_set_touchcal(id);
+    Serial.println("[giga] touch calibration cleared (identity mapping)");
+  }
+  else if (c == 'x' || c == 'X')
+  {
+    // Diagnostic: echo raw GT911 coordinates so the real panel range is visible.
+    static bool dbg = false;
+    dbg = !dbg;
+    ui_touch_debug(dbg);
+    Serial.println(dbg ? "[giga] raw touch echo ON (tap the screen)" : "[giga] raw touch echo OFF");
   }
   else if (c == 'W')
   {
