@@ -39,6 +39,13 @@
 // (SCREEN_H - TABBAR_H); oversizing it makes the tab scroll, which drags the
 // readout off-screen and costs a large repaint on every scroll frame.
 #define HUNTER_ARC_D   260
+// Touch release debounce. The GT911 updates at ~100 Hz but LVGL polls it on
+// its own clock, so a poll can land between controller updates and return
+// "no points" while a finger is still down. Without this, LVGL sees a
+// release/press flicker mid-touch: clicks misfire and the 2-point calibration
+// reads one held finger as two taps at the same spot. A gap shorter than this
+// is treated as still pressed.
+#define TOUCH_RELEASE_MS 60
 #define UI_TICK_MS     200      // label refresh cadence
 #define LIVE_REBUILD_MS 400     // min interval between LIVE list rebuilds
 

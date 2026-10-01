@@ -117,15 +117,26 @@ static uint32_t dimColor(uint32_t rgb, uint8_t pct)
 static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
 {
   (void)drv;
+  static uint32_t lastDownMs = 0;
+  static int      lastSx = 0, lastSy = 0;
+
   GDTpoint_t pts[5];
-  uint8_t n = TouchDetector.getTouchPoints(pts);
+  uint8_t  n = TouchDetector.getTouchPoints(pts);
+  uint32_t m = millis();
+
+  // Release debounce (see TOUCH_RELEASE_MS in config.h): an empty poll shorter
+  // than the window after the last real point is still a press.
+  bool down = (n > 0);
+  if (down) lastDownMs = m;
+  else if (m - lastDownMs < TOUCH_RELEASE_MS) down = true;
 
   // Calibration in progress: capture raw taps and report nothing to LVGL so
-  // whatever is under the finger (tab bar, buttons) does not react.
+  // whatever is under the finger (tab bar, buttons) does not react.  A tap is
+  // complete only once the DEBOUNCED release lands.
   if (calMode != CAL_OFF)
   {
-    if (n > 0)        { calRawX = pts[0].x; calRawY = pts[0].y; calDown = true; }
-    else if (calDown) { calDown = false; calTapReady = true; }      // release = tap
+    if (n > 0)                  { calRawX = pts[0].x; calRawY = pts[0].y; calDown = true; }
+    else if (!down && calDown)  { calDown = false; calTapReady = true; }
     data->state = LV_INDEV_STATE_RELEASED;
     return;
   }
@@ -137,7 +148,6 @@ static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
     if (touchDbg)
     {
       static uint32_t lastDbg = 0;
-      uint32_t m = millis();
       if (m - lastDbg > 150)
       {
         lastDbg = m;
@@ -161,8 +171,16 @@ static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
     sy = (int)lroundf(sy * calSy + calOy);
     if (sx < 0) sx = 0; if (sx >= SCREEN_W) sx = SCREEN_W - 1;
     if (sy < 0) sy = 0; if (sy >= SCREEN_H) sy = SCREEN_H - 1;
+    lastSx = sx; lastSy = sy;
     data->point.x = sx;
     data->point.y = sy;
+    data->state   = LV_INDEV_STATE_PRESSED;
+  }
+  else if (down)
+  {
+    // Debounced hold: keep reporting the last point so LVGL sees one press.
+    data->point.x = lastSx;
+    data->point.y = lastSy;
     data->state   = LV_INDEV_STATE_PRESSED;
   }
   else
@@ -257,9 +275,13 @@ static void cal_tick(uint32_t now)
   const int dxs = CAL_T2_X - CAL_T1_X, dys = CAL_T2_Y - CAL_T1_Y;
   const bool plausible = dxr > dxs * 0.5f && dxr < dxs * 1.6f &&
                          dyr > dys * 0.5f && dyr < dys * 1.6f;
+  char note[96];
+  snprintf(note, sizeof(note), "TL %d,%d BR %d,%d span %dx%d",
+           calTLx, calTLy, calRawX, calRawY, dxr, dyr);
   if (!plausible)
   {
-    Serial.print("[touch] cal rejected: raw span "); Serial.print(dxr); Serial.print("x"); Serial.println(dyr);
+    Serial.print("[touch] cal rejected: "); Serial.println(note);
+    storage_append_note("#CAL", "rejected", note);
     cal_finish("Calibration failed - try again");
     return;
   }
@@ -267,6 +289,7 @@ static void cal_tick(uint32_t now)
   const float ox = CAL_T1_X - calTLx * sx, oy = CAL_T1_Y - calTLy * sy;
   calSx = sx; calOx = ox; calSy = sy; calOy = oy;
   bool saved = storage_save_touchcal(sx, ox, sy, oy);
+  storage_append_note("#CAL", saved ? "ok" : "ok-unsaved", note);
   Serial.print("[touch] calibrated: raw TL "); Serial.print(calTLx); Serial.print(","); Serial.print(calTLy);
   Serial.print("  raw BR "); Serial.print(calRawX); Serial.print(","); Serial.print(calRawY);
   Serial.print("  -> sx="); Serial.print(sx, 4); Serial.print(" ox="); Serial.print(ox, 1);

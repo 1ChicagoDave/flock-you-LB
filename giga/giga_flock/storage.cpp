@@ -134,6 +134,18 @@ bool storage_append_strength(int strength, int headingDeg, double lat, double lo
   return (s_log != nullptr);
 }
 
+bool storage_append_note(const char *tag, const char *kind, const char *note)
+{
+  if (!s_ready || !s_log) return false;
+  fprintf(s_log, "%s,%s,0,0,0.000000,0.000000,%lu,0,0.00,\"%s\"\n",
+          tag ? tag : "#?", kind ? kind : "note",
+          (unsigned long)(g_gps.hasFix ? g_gps.utc : 0), note ? note : "");
+  fflush(s_log);
+  fclose(s_log);
+  s_log = fopen(LOG_PATH, "a");
+  return (s_log != nullptr);
+}
+
 // ---- Touch calibration -----------------------------------------------------
 // A bad calibration would make the screen unusable, so values are sanity
 // checked on both save and load, and written temp+rename like the snapshot.

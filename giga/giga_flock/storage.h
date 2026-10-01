@@ -42,6 +42,11 @@ bool storage_append_mark(const char *tag, const char *kind, double lat, double l
 bool storage_append_strength(int strength, int headingDeg, double lat, double lon,
                              uint32_t utc, uint32_t sats, double hdop);
 
+// Free-text marker row: tag,kind,0,0,0,0,utc,0,0,"note". Used for #CAL rows so
+// a calibration attempt (raw corner readings, accepted/rejected) is readable
+// later from the log instead of only on a live serial console.
+bool storage_append_note(const char *tag, const char *kind, const char *note);
+
 // Touch calibration (2-point scale/offset) persisted at /fs/touchcal.bin.
 // save rejects implausible values; load returns false if absent/corrupt.
 bool storage_save_touchcal(float sx, float ox, float sy, float oy);
