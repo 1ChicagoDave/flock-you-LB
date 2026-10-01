@@ -23,3 +23,9 @@ void ui_set_touchcal(const TouchCal &c);
 
 // Echo raw GT911 coordinates to USB serial on every press (diagnostic; serial 'x').
 void ui_touch_debug(bool on);
+
+// Bench soak test (serial 'n'): jump to the NAV tab and drive the compass with a
+// synthetic heading/position at full refresh rate, no GPS required. Reproduces
+// the "moving graphics" repaint load that crashed the unpatched display driver.
+// Logging is untouched - g_gps is never modified, only the NAV readouts.
+void ui_nav_demo(bool on);

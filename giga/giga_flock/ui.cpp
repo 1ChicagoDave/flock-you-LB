@@ -520,6 +520,8 @@ static lv_point_precise_t navArrowPts[5];
 static uint32_t lastNavMs = 0, navSavedUntil = 0;
 static int      navMarkCount = 0;
 static int      navLastArrowDeg = -999, navLastHdgDeg = -999;
+static bool     navDemo = false;          // bench soak test, see ui_nav_demo()
+static double   navDemoDeg = 0.0;
 static const char *NAV_CARD_TXT[4] = { "N", "E", "S", "W" };
 
 // Great-circle distance, metres (haversine).
@@ -736,6 +738,22 @@ static void buildNav()
 
 }
 
+// Only touch the label when the text actually changed: avoids an LVGL
+// text realloc + invalidate twice a second for a value that is sitting still.
+static void setTextIfChanged(lv_obj_t *lbl, const char *txt)
+{
+  const char *cur = lv_label_get_text(lbl);
+  if (cur && strcmp(cur, txt) == 0) return;
+  lv_label_set_text(lbl, txt);
+}
+
+void ui_nav_demo(bool on)
+{
+  navDemo = on;
+  navLastArrowDeg = navLastHdgDeg = -999;     // force a redraw either way
+  if (on) lv_tabview_set_active(tabview, NAV_TAB_IDX, LV_ANIM_OFF);
+}
+
 // Refresh the NAV readouts; only while the tab is showing, and only moves the
 // arrow/letters when the angle actually changed.
 static void nav_tick(uint32_t now)
@@ -746,35 +764,48 @@ static void nav_tick(uint32_t now)
 
   if (navSavedUntil && now >= navSavedUntil) { lv_label_set_text(navSaved, ""); navSavedUntil = 0; }
 
-  char buf[48];
-  if (!g_gps.hasFix)
+  // Inputs. The soak test substitutes a synthetic orbit around the target with a
+  // heading that advances every tick, so the arrow AND the rose both move at
+  // the full refresh rate - the heaviest repaint pattern this screen can make.
+  bool   fix = g_gps.hasFix, cv = g_gps.courseValid;
+  double lat = g_gps.lat, lon = g_gps.lon, crs = g_gps.course;
+  if (navDemo)
   {
-    lv_label_set_text(navDist, "no fix");
-    lv_label_set_text(navBrg,  "--");
-    lv_label_set_text(navHdg,  "HDG --");
+    navDemoDeg += 7.0; if (navDemoDeg >= 360.0) navDemoDeg -= 360.0;
+    fix = true; cv = true; crs = navDemoDeg;
+    lat = NAV_TARGET_LAT + 0.012 * cos(navDemoDeg * NAV_D2R);   // ~1.3 km orbit
+    lon = NAV_TARGET_LON + 0.012 * sin(navDemoDeg * NAV_D2R);
+  }
+
+  char buf[48];
+  if (!fix)
+  {
+    setTextIfChanged(navDist, "no fix");
+    setTextIfChanged(navBrg,  "--");
+    setTextIfChanged(navHdg,  "HDG --");
     lv_obj_add_flag(navArrow, LV_OBJ_FLAG_HIDDEN);
     return;
   }
 
-  double dist = navDistanceM(g_gps.lat, g_gps.lon, NAV_TARGET_LAT, NAV_TARGET_LON);
-  double brg  = navBearingDeg(g_gps.lat, g_gps.lon, NAV_TARGET_LAT, NAV_TARGET_LON);
+  double dist = navDistanceM(lat, lon, NAV_TARGET_LAT, NAV_TARGET_LON);
+  double brg  = navBearingDeg(lat, lon, NAV_TARGET_LAT, NAV_TARGET_LON);
   navFmtDist(buf, sizeof(buf), dist);
-  lv_label_set_text(navDist, buf);
+  setTextIfChanged(navDist, buf);
   snprintf(buf, sizeof(buf), "%s  %03d°", navCardinal8(brg), (int)lround(brg) % 360);
-  lv_label_set_text(navBrg, buf);
+  setTextIfChanged(navBrg, buf);
 
   int hdg = 0;
-  if (g_gps.courseValid)
+  if (cv)
   {
-    hdg = (int)lround(g_gps.course) % 360;
-    snprintf(buf, sizeof(buf), "HDG %03d°  %s", hdg, navCardinal8(g_gps.course));
-    lv_label_set_text(navHdg, buf);
-    lv_label_set_text(navMode, "heading-up");
+    hdg = (int)lround(crs) % 360;
+    snprintf(buf, sizeof(buf), "HDG %03d°  %s", hdg, navCardinal8(crs));
+    setTextIfChanged(navHdg, buf);
+    setTextIfChanged(navMode, navDemo ? "heading-up  (DEMO)" : "heading-up");
   }
   else
   {
-    lv_label_set_text(navHdg,  "HDG --  (stopped)");
-    lv_label_set_text(navMode, "north-up");
+    setTextIfChanged(navHdg,  "HDG --  (stopped)");
+    setTextIfChanged(navMode, "north-up");
   }
 
   int arrowDeg = (((int)lround(brg) - hdg) % 360 + 360) % 360;

@@ -468,7 +468,8 @@ void setup()
 }
 
 // Simple USB-serial console:  t = status,  d = dump the CSV log,
-// c = clear touch calibration,  x = toggle raw touch echo,  W = test hang.
+// c = clear touch calibration,  x = toggle raw touch echo,  n = NAV demo soak,
+// W = test hang.
 static void serialCmdTick()
 {
   if (!Serial.available()) return;
@@ -511,6 +512,13 @@ static void serialCmdTick()
     dbg = !dbg;
     ui_touch_debug(dbg);
     Serial.println(dbg ? "[giga] raw touch echo ON (tap the screen)" : "[giga] raw touch echo OFF");
+  }
+  else if (c == 'n' || c == 'N')
+  {
+    static bool demo = false;
+    demo = !demo;
+    ui_nav_demo(demo);
+    Serial.println(demo ? "[giga] NAV demo ON: compass spinning (soak test)" : "[giga] NAV demo OFF");
   }
   else if (c == 'W')
   {
