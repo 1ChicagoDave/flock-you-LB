@@ -1,0 +1,27 @@
+--- a/libraries/Arduino_H7_Video/src/Arduino_H7_Video.cpp
++++ b/libraries/Arduino_H7_Video/src/Arduino_H7_Video.cpp
+@@ -251,7 +251,23 @@
+     lv_display_rotation_t rotation = lv_display_get_rotation(disp);
+     lv_area_t rotated_area;
+     if (rotation != LV_DISPLAY_ROTATION_0) {
+-        rotated_buf = (uint8_t*)realloc(rotated_buf, w * h * 4);
++        // PATCHED (flock-you-LB, see giga/core-patches/): allocate the rotation
++        // buffer ONCE at the largest size a partial flush can need, instead of
++        // realloc()ing it on EVERY flush. Per-flush reallocs of varying size
++        // fragment the heap, and the original never checked for NULL - a failed
++        // realloc handed a null destination to lv_draw_sw_rotate and hard-
++        // faulted in the middle of a repaint (swipes / tab changes hit it most).
++        static size_t rotated_cap = 0;
++        size_t need = (size_t)w * h * 4;
++        if (rotated_buf == nullptr || need > rotated_cap) {
++            size_t cap = (size_t)lv_display_get_draw_buf_size(disp) * 2;   // 4 B/px out vs 2 B/px in
++            if (cap < need) cap = need;
++            uint8_t* nb = (uint8_t*)malloc(cap);
++            if (nb == nullptr) { lv_display_flush_ready(disp); return; }  // drop the frame, never crash
++            free(rotated_buf);
++            rotated_buf = nb;
++            rotated_cap = cap;
++        }
+         lv_color_format_t cf = lv_display_get_color_format(disp);
+         #if (LVGL_VERSION_MINOR < 2) 
+         rotation = LV_DISPLAY_ROTATION_90; // bugfix: force 90 degree rotation for lvgl 9.1 end earlier

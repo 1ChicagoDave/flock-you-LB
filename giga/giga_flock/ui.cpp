@@ -42,12 +42,18 @@
 // The touch object is created in the .ino; we just reference it.
 extern Arduino_GigaDisplayTouch TouchDetector;
 
-// ---- touch coordinate remap ----
-// On this unit the GT911 already reports landscape-aligned coords (x:0..799
-// right, y:0..479 down), so the mapping is identity.  The earlier swap+invert
-// rotated every gesture 90° (horizontal swipes scrolled, vertical swipes changed
-// tabs).  If a single axis ends up MIRRORED (taps land, but left/right or
-// up/down is reversed), flip just that INV_* bit — do NOT re-enable the swap.
+// ---- touch coordinate frame (READ THIS BEFORE "FIXING" TOUCH) ----
+// The GT911 reports in the panel's NATIVE PORTRAIT frame: x 0..479, y 0..799.
+// Arduino_H7_Video creates the LVGL display as 480x800 and sets
+// LV_DISPLAY_ROTATION_270 to get our 800x480 landscape, and LVGL then rotates
+// POINTER INPUT itself (lv_indev.c -> lv_display_rotate_point):
+//     logical.x = raw.y          logical.y = 479 - raw.x
+// So this callback must hand LVGL the RAW point. Swapping/inverting here
+// double-rotates (that was the August "gestures are 90 degrees off" bug), and
+// clamping to the LANDSCAPE size here capped raw.y (= logical X) at 479 and
+// made the right half of the screen untappable (the "right side is less
+// reliable" bug). Clamp to the native frame. The 2-point calibration below
+// also works entirely in the raw frame for the same reason.
 #define TOUCH_SWAP_XY   0
 #define TOUCH_INV_X     0
 #define TOUCH_INV_Y     0
@@ -169,8 +175,9 @@ static void touch_read_cb(lv_indev_t *drv, lv_indev_data_t *data)
     // 2-point calibration (identity until the user calibrates).
     sx = (int)lroundf(sx * calSx + calOx);
     sy = (int)lroundf(sy * calSy + calOy);
-    if (sx < 0) sx = 0; if (sx >= SCREEN_W) sx = SCREEN_W - 1;
-    if (sy < 0) sy = 0; if (sy >= SCREEN_H) sy = SCREEN_H - 1;
+    // Native-frame clamp (480x800). NOT the landscape size - see the note above.
+    if (sx < 0) sx = 0; if (sx >= PANEL_NATIVE_W) sx = PANEL_NATIVE_W - 1;
+    if (sy < 0) sy = 0; if (sy >= PANEL_NATIVE_H) sy = PANEL_NATIVE_H - 1;
     lastSx = sx; lastSy = sy;
     data->point.x = sx;
     data->point.y = sy;
@@ -270,14 +277,19 @@ static void cal_tick(uint32_t now)
     return;
   }
 
-  // Second tap: derive scale/offset from the two raw points.
-  const int dxr = calRawX - calTLx, dyr = calRawY - calTLy;
-  const int dxs = CAL_T2_X - CAL_T1_X, dys = CAL_T2_Y - CAL_T1_Y;
-  const bool plausible = dxr > dxs * 0.5f && dxr < dxs * 1.6f &&
-                         dyr > dys * 0.5f && dyr < dys * 1.6f;
-  char note[96];
-  snprintf(note, sizeof(note), "TL %d,%d BR %d,%d span %dx%d",
-           calTLx, calTLy, calRawX, calRawY, dxr, dyr);
+  // Second tap. Work in the RAW (panel-native) frame: LVGL rotates whatever we
+  // hand it (ROTATION_270: logical.x = raw.y, logical.y = 479 - raw.x), so the
+  // raw reading each on-screen target SHOULD produce is the inverse of that.
+  const int e1x = PANEL_NATIVE_W - 1 - CAL_T1_Y, e1y = CAL_T1_X;   // expected raw, target 1
+  const int e2x = PANEL_NATIVE_W - 1 - CAL_T2_Y, e2y = CAL_T2_X;   // expected raw, target 2
+  const int dxr = calRawX - calTLx, dyr = calRawY - calTLy;        // measured span
+  const int dxe = e2x - e1x,        dye = e2y - e1y;               // expected span
+  char note[112];
+  snprintf(note, sizeof(note), "TL %d,%d BR %d,%d span %dx%d expect %dx%d",
+           calTLx, calTLy, calRawX, calRawY, dxr, dyr, dxe, dye);
+  const float sx = (dxr != 0) ? (float)dxe / dxr : 0.0f;
+  const float sy = (dyr != 0) ? (float)dye / dyr : 0.0f;
+  const bool plausible = sx > 0.5f && sx < 2.0f && sy > 0.5f && sy < 2.0f;
   if (!plausible)
   {
     Serial.print("[touch] cal rejected: "); Serial.println(note);
@@ -285,8 +297,7 @@ static void cal_tick(uint32_t now)
     cal_finish("Calibration failed - try again");
     return;
   }
-  const float sx = (float)dxs / dxr, sy = (float)dys / dyr;
-  const float ox = CAL_T1_X - calTLx * sx, oy = CAL_T1_Y - calTLy * sy;
+  const float ox = e1x - calTLx * sx, oy = e1y - calTLy * sy;
   calSx = sx; calOx = ox; calSy = sy; calOy = oy;
   bool saved = storage_save_touchcal(sx, ox, sy, oy);
   storage_append_note("#CAL", saved ? "ok" : "ok-unsaved", note);
@@ -580,6 +591,12 @@ static void navSetCardinals(int hdgDeg)
 static void nav_strength_cb(lv_event_t *e)
 {
   int s   = (int)(intptr_t)lv_event_get_user_data(e);
+  // One tap, one row: ignore a repeat of the same button inside 400 ms.
+  static int      lastS  = -1;
+  static uint32_t lastMs = 0;
+  uint32_t m = millis();
+  if (s == lastS && m - lastMs < 400) return;
+  lastS = s; lastMs = m;
   int hdg = g_gps.courseValid ? (int)lround(g_gps.course) : -1;
   bool ok = storage_append_strength(s, hdg,
                                     g_gps.hasFix ? g_gps.lat : 0.0,
@@ -766,6 +783,30 @@ static void nav_tick(uint32_t now)
   lv_obj_remove_flag(navArrow, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ---- UI activity rows (crash attribution) ----
+// The field crashes reboot via the hardware watchdog without ever reaching the
+// hang thread, i.e. they are hard faults, and this core has no crash capture.
+// So we leave a note in the log at the two moments the user reports them:
+// the start of a swipe and the completion of a tab change. A #BOOT that
+// follows "#UI,swipe" with nothing in between is a crash mid-swipe.
+static void swipe_begin_cb(lv_event_t *e)
+{
+  (void)e;
+  static uint32_t last = 0;
+  uint32_t m = millis();
+  if (m - last < 2000) return;             // one note per gesture, not per bounce
+  last = m;
+  if (g_logReady) storage_append_note("#UI", "swipe", "tab scroll begin");
+}
+
+static void tab_changed_cb(lv_event_t *e)
+{
+  (void)e;
+  char b[24];
+  snprintf(b, sizeof(b), "tab %lu", (unsigned long)lv_tabview_get_tab_active(tabview));
+  if (g_logReady) storage_append_note("#UI", "tab", b);
+}
+
 void ui_init()
 {
   // Global dark background on the active screen.
@@ -783,6 +824,8 @@ void ui_init()
   tabAlert  = lv_tabview_add_tab(tabview, "ALERT");
   tabHunter = lv_tabview_add_tab(tabview, "HUNTER");
   tabNav    = lv_tabview_add_tab(tabview, "NAV");
+  lv_obj_add_event_cb(tabview, tab_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
+  lv_obj_add_event_cb(lv_tabview_get_content(tabview), swipe_begin_cb, LV_EVENT_SCROLL_BEGIN, NULL);
 
   buildLive();
   buildStats();
