@@ -29,3 +29,8 @@ void ui_touch_debug(bool on);
 // the "moving graphics" repaint load that crashed the unpatched display driver.
 // Logging is untouched - g_gps is never modified, only the NAV readouts.
 void ui_nav_demo(bool on);
+
+// Re-read the live backlight level into the STATS brightness button. Call after
+// changing the level from outside the UI (boot restore, serial command), since
+// the button is built before the saved level has been read off flash.
+void ui_backlight_refresh();

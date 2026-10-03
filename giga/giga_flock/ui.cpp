@@ -37,6 +37,7 @@
 #include "Arduino_GigaDisplayTouch.h"
 #include "storage.h"   // NAV Strength marks -> CSV
 #include "audio.h"     // tap confirmation blip
+#include "backlight.h" // STATS brightness button
 #include <math.h>
 
 // The touch object is created in the .ino; we just reference it.
@@ -83,6 +84,7 @@ static lv_obj_t *calRing = nullptr, *calDot = nullptr, *calMsg = nullptr;
 // ---- widget handles ----
 static lv_obj_t *tabview;
 static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter;
+static lv_obj_t *blPct = nullptr, *blWord = nullptr;   // STATS brightness button
 
 static lv_obj_t *liveList;              // flex container of row labels
 static uint32_t  lastLiveRebuild = 0;
@@ -315,6 +317,43 @@ static void stats_cal_cb(lv_event_t *e)
   cal_begin();
 }
 
+// ---- STATS brightness button ----
+// Steps through BL_PRESET_LIST. A cycling button rather than a slider on
+// purpose: it needs one tap, no drag, and has to be usable at night without
+// looking straight at it. The list wraps so the dimmest setting is one tap from
+// full brightness again.
+static void blSetLabels(uint8_t pct)
+{
+  if (!blPct) return;
+  char b[8];
+  snprintf(b, sizeof(b), "%u%%", (unsigned)pct);
+  lv_label_set_text(blPct, b);
+  lv_label_set_text(blWord, backlight_label(pct));
+}
+
+void ui_backlight_refresh()
+{
+  blSetLabels(backlight_get());
+}
+
+static void stats_bl_cb(lv_event_t *e)
+{
+  (void)e;
+  // One tap, one step: ignore a repeat inside 400 ms (same guard the NAV
+  // Strength buttons use, for the same GT911 reason).
+  static uint32_t lastMs = 0;
+  uint32_t m = millis();
+  if (m - lastMs < 400) return;
+  lastMs = m;
+
+  uint8_t pct = backlight_cycle();
+  blSetLabels(pct);
+  // Written immediately. The device power-cycles at every engine-off, so a level
+  // held only in RAM would be lost before the next trip.
+  if (g_logReady) storage_save_backlight(pct);
+  audio_tick();
+}
+
 static void register_touch()
 {
   // LVGL v9 input-device registration (see the v8->v9 note at the top).
@@ -362,8 +401,17 @@ static void buildLive()
 
 static void buildStats()
 {
+  // Two columns: readouts + calibrate on the left, brightness on the right.
+  // Scrolling is removed rather than left to chance — a scrollbar here would
+  // drag content off-screen and cost a full repaint per scroll frame, which is
+  // what wedged the HUNTER tab once already.
+  lv_obj_remove_flag(tabStats, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_style_pad_all(tabStats, 0, 0);
+  lv_obj_set_style_pad_column(tabStats, 0, 0);
+  lv_obj_set_flex_flow(tabStats, LV_FLEX_FLOW_ROW);
+
   lv_obj_t *col = lv_obj_create(tabStats);
-  lv_obj_set_size(col, LV_PCT(100), LV_PCT(100));
+  lv_obj_set_size(col, 560, LV_PCT(100));
   lv_obj_set_style_bg_color(col, hx(COL_BG), 0);
   lv_obj_set_style_border_width(col, 0, 0);
   lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
@@ -394,6 +442,54 @@ static void buildStats()
   lv_obj_set_style_text_font(cl, &lv_font_montserrat_20, 0);
   lv_obj_set_style_text_color(cl, hx(COL_TEXT), 0);
   lv_obj_center(cl);
+
+  // ---- right-hand column: backlight ----
+  lv_obj_t *side = lv_obj_create(tabStats);
+  lv_obj_set_size(side, 230, LV_PCT(100));
+  lv_obj_set_style_bg_color(side, hx(COL_BG), 0);
+  lv_obj_set_style_border_width(side, 0, 0);
+  lv_obj_remove_flag(side, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_set_flex_flow(side, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(side, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_all(side, 6, 0);
+  // Clear the two status dots, which are pinned to the top right of every tab
+  // on the top layer and would otherwise sit on this heading.
+  lv_obj_set_style_pad_top(side, 30, 0);
+
+  lv_obj_t *ttl = lv_label_create(side);
+  lv_label_set_text(ttl, "BACKLIGHT");
+  lv_obj_set_style_text_font(ttl, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(ttl, hx(COL_DIM), 0);
+
+  // Deliberately oversized: this gets pressed in the dark, in a moving vehicle.
+  lv_obj_t *bb = lv_button_create(side);
+  lv_obj_set_size(bb, 200, 150);
+  lv_obj_set_style_margin_top(bb, 10, 0);
+  lv_obj_set_style_bg_color(bb, hx(0x1E2A3A), 0);
+  lv_obj_set_style_bg_color(bb, hx(COL_OK), LV_STATE_PRESSED);
+  lv_obj_set_style_radius(bb, 12, 0);
+  lv_obj_set_flex_flow(bb, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(bb, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_add_event_cb(bb, stats_bl_cb, LV_EVENT_CLICKED, NULL);
+
+  blPct = lv_label_create(bb);
+  lv_obj_set_style_text_font(blPct, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_color(blPct, hx(COL_TEXT), 0);
+  lv_label_set_text(blPct, "100%");
+
+  blWord = lv_label_create(bb);
+  lv_obj_set_style_text_font(blWord, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(blWord, hx(COL_DIM), 0);
+  lv_label_set_text(blWord, "DAY");
+
+  lv_obj_t *hint = lv_label_create(side);
+  lv_label_set_text(hint, "tap to dim");
+  lv_obj_set_style_text_color(hint, hx(COL_DIM), 0);
+  lv_obj_set_style_margin_top(hint, 8, 0);
+
+  blSetLabels(backlight_get());
 }
 
 static void buildAlert()

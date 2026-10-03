@@ -199,6 +199,47 @@ void storage_clear_touchcal()
   remove(TCAL_TMP);
 }
 
+// ---- Backlight level -------------------------------------------------------
+// Same temp+rename discipline as the touch calibration: the ignition can cut
+// power at any instant, and a truncated settings file must never read back as a
+// plausible level.
+#define BLT_PATH "/fs/backlight.bin"
+#define BLT_TMP  "/fs/backlight.tmp"
+struct BlRec { char magic[4]; uint8_t pct; uint8_t pad[3]; };
+
+bool storage_save_backlight(uint8_t pct)
+{
+  if (!s_ready || pct > 100) return false;
+  FILE *f = fopen(BLT_TMP, "wb");
+  if (!f) return false;
+  BlRec r;
+  memcpy(r.magic, "FYBL", 4);
+  r.pct = pct;
+  r.pad[0] = r.pad[1] = r.pad[2] = 0;
+  bool ok = (fwrite(&r, sizeof(r), 1, f) == 1);
+  fflush(f);
+  if (fclose(f) != 0) ok = false;
+  if (!ok) { remove(BLT_TMP); return false; }
+  remove(BLT_PATH);
+  rename(BLT_TMP, BLT_PATH);
+  return true;
+}
+
+bool storage_load_backlight(uint8_t *pct)
+{
+  if (!s_ready || !pct) return false;
+  FILE *f = fopen(BLT_PATH, "rb");
+  if (!f) f = fopen(BLT_TMP, "rb");            // interrupted save
+  if (!f) return false;
+  BlRec r;
+  bool ok = (fread(&r, sizeof(r), 1, f) == 1) &&
+            memcmp(r.magic, "FYBL", 4) == 0 && r.pct <= 100;
+  fclose(f);
+  if (!ok) return false;
+  *pct = r.pct;
+  return true;
+}
+
 // ---- Device-table snapshot (survives reboot so hit counts persist) ----------
 // Binary blob at /fs/fy_table.bin: header + raw DeviceEntry array.  recSize guards
 // against a struct-layout change (a mismatched file is ignored, starts fresh).

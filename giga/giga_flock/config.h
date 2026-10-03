@@ -46,6 +46,24 @@
 // reads one held finger as two taps at the same spot. A gap shorter than this
 // is treated as still pressed.
 #define TOUCH_RELEASE_MS 60
+// ---- Display backlight (night driving) --------------------------------------
+// Levels the STATS brightness button steps through, brightest first. The list
+// WRAPS, so one more tap at the dimmest setting jumps straight back to full
+// instead of walking back up through every level in the morning.
+// Spacing is perceptual, not linear: apparent brightness tracks roughly the
+// square root of duty cycle, so 55/30/15/5 percent read as about 75/55/39/22
+// percent as bright, which is an even-feeling ladder.
+// No entry is 0. A black screen is indistinguishable from a crash, and this
+// device reboots at every engine-off, so the dimmest step stays readable.
+#define BL_PRESET_LIST  { 100, 55, 30, 15, 5 }
+#define BL_LABEL_LIST   { "DAY", "DIM", "DUSK", "NIGHT", "DARK" }
+// Applied the instant we boot, before the saved level can be read off QSPI
+// (a second or two). Deliberately the dimmest preset: a brief dim moment in
+// daylight costs nothing, a full-brightness flash at night is the complaint.
+#define BL_BOOT_PCT     5
+// Used when no level has been saved yet, or when the QSPI log is disabled.
+#define BL_DEFAULT_PCT  100
+
 #define UI_TICK_MS     200      // label refresh cadence
 #define LIVE_REBUILD_MS 400     // min interval between LIVE list rebuilds
 

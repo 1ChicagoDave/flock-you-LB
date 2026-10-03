@@ -75,6 +75,7 @@
 #include "storage.h"
 #include "audio.h"
 #include "ui.h"
+#include "backlight.h"
 
 // ---- display / touch / LED objects ----
 Arduino_H7_Video       Display(SCREEN_W, SCREEN_H, GigaDisplayShield);
@@ -404,6 +405,14 @@ static void pollGps()
 // ============================================================================
 void setup()
 {
+  // FIRST thing on purpose. The backlight pin comes out of reset enabled, so the
+  // panel is at full brightness from power-on; every instruction before this one
+  // is time spent blinding the driver at night. The GIGA bootloader runs before
+  // any of this, so a brief bright flash at power-on is not avoidable from here,
+  // but the application no longer adds to it. The saved level is applied further
+  // down, once QSPI is mounted.
+  backlight_begin(BL_BOOT_PCT);
+
   Serial.begin(115200);           // USB debug only
   ESP32_SERIAL.begin(ESP32_BAUD); // Serial4: D14=TX, D15=RX (D18/D19 don't work here)
   GPS_SERIAL.begin(GPS_BAUD);     // Serial3: D16=TX, D17=RX (GPS)
@@ -420,6 +429,19 @@ void setup()
   // QSPI event log — non-fatal if it fails (see storage.cpp one-time-format note).
   g_logReady = storage_init();
   Serial.println(g_logReady ? "[giga] QSPI log ready" : "[giga] QSPI log DISABLED");
+
+  // Saved backlight level. Without persistence this would reset to full on every
+  // trip, because the device power-cycles whenever the ignition goes off.
+  {
+    uint8_t pct = BL_DEFAULT_PCT;
+    bool restored = (g_logReady && storage_load_backlight(&pct));
+    backlight_set(pct);
+    ui_backlight_refresh();
+    Serial.print(restored ? "[giga] backlight restored: " : "[giga] backlight default: ");
+    Serial.print(pct);
+    Serial.print("% ");
+    Serial.println(backlight_label(pct));
+  }
 
   // Touch calibration from the STATS screen, if one has been saved.
   {
@@ -469,6 +491,7 @@ void setup()
 
 // Simple USB-serial console:  t = status,  d = dump the CSV log,
 // c = clear touch calibration,  x = toggle raw touch echo,  n = NAV demo soak,
+// b = cycle backlight brightness,
 // W = test hang.
 static void serialCmdTick()
 {
@@ -478,6 +501,8 @@ static void serialCmdTick()
   {
     Serial.println("=== GIGA status ===");
     Serial.print("QSPI log   : "); Serial.println(g_logReady ? "READY" : "DISABLED (needs one-time QSPIFormat)");
+    Serial.print("backlight  : "); Serial.print(backlight_get());
+    Serial.print("% "); Serial.println(backlight_label(backlight_get()));
     Serial.print("unique dev : "); Serial.println(g_devCount);
     Serial.print("events log : "); Serial.println((unsigned long)g_totalEvents);
     Serial.print("ESP32 link : "); Serial.println(g_link.everSeen ? "seen" : "never");
@@ -512,6 +537,15 @@ static void serialCmdTick()
     dbg = !dbg;
     ui_touch_debug(dbg);
     Serial.println(dbg ? "[giga] raw touch echo ON (tap the screen)" : "[giga] raw touch echo OFF");
+  }
+  else if (c == 'b' || c == 'B')
+  {
+    // Same cycle the STATS button walks, reachable without touching the screen.
+    uint8_t pct = backlight_cycle();
+    ui_backlight_refresh();
+    if (g_logReady) storage_save_backlight(pct);
+    Serial.print("[giga] backlight "); Serial.print(pct);
+    Serial.print("% "); Serial.println(backlight_label(pct));
   }
   else if (c == 'n' || c == 'N')
   {

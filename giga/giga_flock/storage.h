@@ -53,6 +53,12 @@ bool storage_save_touchcal(float sx, float ox, float sy, float oy);
 bool storage_load_touchcal(float *sx, float *ox, float *sy, float *oy);
 void storage_clear_touchcal();
 
+// Display backlight level (0..100) persisted at /fs/backlight.bin. This has to
+// persist because the device power-cycles at every engine-off: without it the
+// screen would come back at full brightness on every single trip.
+bool storage_save_backlight(uint8_t pct);
+bool storage_load_backlight(uint8_t *pct);
+
 // Device-table snapshot so hit counts survive a reboot/power cycle.
 // save writes /fs/fy_table.bin; load restores g_dev / g_devCount / g_totalEvents.
 void storage_save_table();
