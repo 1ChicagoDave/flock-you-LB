@@ -503,7 +503,7 @@ void setup()
 // Simple USB-serial console:  t = status,  d = dump the CSV log,
 // c = clear touch calibration,  x = toggle raw touch echo,  n = NAV demo soak,
 // b = cycle backlight brightness,  L = visible backlight pin test,
-// f = step backlight PWM frequency,
+// f = step backlight PWM frequency,  s = brightness sweep,  m = measure pad,
 // W = test hang.
 static void serialCmdTick()
 {
@@ -562,6 +562,12 @@ static void serialCmdTick()
     Serial.print("[giga] backlight "); Serial.print(pct);
     Serial.print("% "); Serial.print(backlight_label(pct));
     Serial.println(saved ? "  (saved)" : "  (NOT saved)");
+  }
+  else if (c == 's' || c == 'S')
+  {
+    Serial.println("[giga] brightness sweep: 17 steps, ~1.8 s each, ~30 s total.");
+    Serial.println("[giga] watch the screen; note where it stops getting darker.");
+    backlight_sweep_begin();
   }
   else if (c == 'm' || c == 'M')
   {
@@ -687,7 +693,8 @@ void loop()
   pollEsp32();          // parse ESP32 detection/status JSON
   pollGps();            // parse NMEA, refresh fix state
   ledTick(now);         // clear the class-color flash after LED_FLASH_MS
-  if (backlight_test_tick(now)) ui_backlight_refresh();
+  if (backlight_test_tick(now))  ui_backlight_refresh();
+  if (backlight_sweep_tick(now)) ui_backlight_refresh();
   ui_tick(now);         // refresh LVGL labels / LIVE list from global state
   serialCmdTick();      // USB-serial console (t=status, d=dump CSV)
   tableSaveTick(now);   // periodic device-table snapshot to QSPI

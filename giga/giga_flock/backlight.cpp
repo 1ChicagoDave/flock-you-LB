@@ -179,3 +179,47 @@ bool backlight_test_tick(uint32_t now)
   s_testNext = now + 1200;
   return false;
 }
+
+// ---- characterisation sweep ----
+// Sampled finer where it matters: the top end of this panel is perceptually
+// compressed (55% looks close to 100%), the middle holds the useful range, and
+// the bottom is included because it misbehaves and that needs mapping.
+static const uint8_t BL_SWEEP[] = {
+  100, 85, 70, 60, 55, 50, 45, 40, 35, 30, 25, 20, 15, 12, 10, 8, 5
+};
+static const uint8_t BL_SWEEP_N = (uint8_t)(sizeof(BL_SWEEP) / sizeof(BL_SWEEP[0]));
+static uint8_t  s_sweepIdx   = 255;        // 255 = idle
+static uint32_t s_sweepNext  = 0;
+static uint8_t  s_sweepSaved = 0;
+
+void backlight_sweep_begin()
+{
+  s_sweepSaved = s_pct;
+  s_sweepIdx   = 0;
+  s_sweepNext  = millis();
+}
+
+bool backlight_sweep_tick(uint32_t now)
+{
+  if (s_sweepIdx == 255) return false;
+  if ((int32_t)(now - s_sweepNext) < 0) return false;
+
+  if (s_sweepIdx >= BL_SWEEP_N)
+  {
+    s_sweepIdx = 255;
+    backlight_set(s_sweepSaved);
+    Serial.print("[sweep] done, restored to ");
+    Serial.print(s_sweepSaved);
+    Serial.println("%");
+    return true;
+  }
+
+  uint8_t pct = BL_SWEEP[s_sweepIdx];
+  backlight_set(pct);
+  Serial.print("[sweep] ");
+  Serial.print(s_sweepIdx + 1); Serial.print("/"); Serial.print(BL_SWEEP_N);
+  Serial.print("  duty "); Serial.print(pct); Serial.println("%");
+  s_sweepIdx++;
+  s_sweepNext = now + 1800;
+  return false;
+}

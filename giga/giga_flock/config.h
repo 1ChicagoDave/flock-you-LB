@@ -55,8 +55,19 @@
 // percent as bright, which is an even-feeling ladder.
 // No entry is 0. A black screen is indistinguishable from a crash, and this
 // device reboots at every engine-off, so the dimmest step stays readable.
-#define BL_PRESET_LIST  { 100, 55, 30, 15, 5 }
-#define BL_LABEL_LIST   { "DAY", "DIM", "DUSK", "NIGHT", "DARK" }
+// PERCEIVED brightness on this panel is NOT monotonic in duty cycle, so these
+// values come from measurement by eye, not from arithmetic. Reported 2026-10-03
+// at 100 Hz, ordered by how bright they actually look:
+//     100  bright
+//      55  only slightly dimmer than 100
+//       5  lands between 55 and 30   <-- out of order, so NOT used
+//      30  pretty dark
+//      15  the darkest available
+// 5% is dropped: it reads brighter than both 30% and 15%, so including it made
+// the button appear to run backwards. Below is the monotonic region only, and
+// anything added here has to be checked by eye rather than assumed.
+#define BL_PRESET_LIST  { 100, 55, 30, 15 }
+#define BL_LABEL_LIST   { "DAY", "DIM", "DUSK", "NIGHT" }
 // Applied the instant we boot, before the saved level can be read off QSPI
 // (a second or two). Deliberately the dimmest preset: a brief dim moment in
 // daylight costs nothing, a full-brightness flash at night is the complaint.
@@ -70,7 +81,12 @@
 // fast. At 100 Hz it visibly dims. Field-reported, then confirmed on the pad.
 // Runtime-adjustable with serial f, and whatever is chosen is persisted.
 #define BL_STEP_US_DEFAULT 500
-#define BL_BOOT_PCT     5
+// Applied the instant we boot, before the saved level can be read off QSPI. The
+// DARKEST setting, which on this panel is 15 and NOT the lowest number: this was
+// 5, which renders brighter than both 30 and 15, so the boot dim was working
+// against its own purpose. A brief dim moment in daylight costs nothing; a
+// full-brightness flash at night is the original complaint.
+#define BL_BOOT_PCT     15
 // Used when no level has been saved yet, or when the QSPI log is disabled.
 #define BL_DEFAULT_PCT  100
 // Ignore a second brightness tap inside this window, measured from the END of the

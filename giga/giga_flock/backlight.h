@@ -66,6 +66,14 @@ uint32_t backlight_isr_count();
 uint32_t backlight_step_us();
 void backlight_set_step_us(uint32_t us);
 
+// Characterisation sweep: walks duty from 100% down to 5% in uneven steps,
+// holding each ~1.8 s and printing it, then restores the level it started from.
+// Needed because perceived brightness on this panel is not monotonic in duty, so
+// the only honest way to pick a ladder is to watch one. Non-blocking; drive from
+// loop(). Returns true on the tick that finishes it.
+void backlight_sweep_begin();
+bool backlight_sweep_tick(uint32_t now);
+
 // Slow visible pin test: parks the pin dark/lit in ~1.2 s phases so it is obvious
 // to the eye whether this pin controls the backlight at all. Non-blocking, so it
 // cannot trip the 4 s hang watchdog; drive it from loop(). Returns true on the
