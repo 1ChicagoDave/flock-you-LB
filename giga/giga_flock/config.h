@@ -55,22 +55,23 @@
 // percent as bright, which is an even-feeling ladder.
 // No entry is 0. A black screen is indistinguishable from a crash, and this
 // device reboots at every engine-off, so the dimmest step stays readable.
-// PERCEIVED brightness on this panel is NOT monotonic in duty cycle, so these
-// values come from measurement by eye, not from arithmetic. Reported 2026-10-03
-// at 100 Hz, ordered by how bright they actually look:
-//     100  bright
-//      55  only slightly dimmer than 100
-//       5  lands between 55 and 30   <-- out of order, so NOT used
-//      30  pretty dark
-//      15  the darkest available
-// 5% is dropped: it reads brighter than both 30% and 15%, so including it made
-// the button appear to run backwards. Below is the monotonic region only, and
-// anything added here has to be checked by eye rather than assumed.
-#define BL_PRESET_LIST  { 100, 55, 30, 15 }
-#define BL_LABEL_LIST   { "DAY", "DIM", "DUSK", "NIGHT" }
-// Applied the instant we boot, before the saved level can be read off QSPI
-// (a second or two). Deliberately the dimmest preset: a brief dim moment in
-// daylight costs nothing, a full-brightness flash at night is the complaint.
+// Backlight levels are MEASURED on this panel, never derived from the numbers.
+// A 17-point duty sweep (serial s) at 100 Hz, reported 2026-10-03:
+//
+//   100 .. 45   all "extremely subtle" differences, effectively full brightness
+//    40 -> 35   ONE DRASTIC JUMP. This is the knee: above it the backlight
+//               converter stays essentially fully on, below it the enable pin
+//               actually gates the output.
+//    35 .. 15   keeps getting darker but only subtly. 15 is the darkest.
+//    12, 10, 8, 5   NO further change. 15% is the floor; below it is wasted.
+//
+// Hence three levels, not five. 100 and 35 straddle the knee, which is the only
+// transition that really reads as a brightness change, and 15 is the floor for
+// night. A step at 55 was dropped because it looks like DAY, and everything at or
+// below 12 was dropped because it looks like NIGHT. Adding evenly spaced values
+// back here would just add taps that change nothing.
+#define BL_PRESET_LIST  { 100, 35, 15 }
+#define BL_LABEL_LIST   { "DAY", "DUSK", "NIGHT" }
 // PWM step period in microseconds. 20 steps per cycle, so 500 us = 100 Hz.
 //
 // NOT 250 us / 200 Hz, which was the first choice and does not dim this panel AT

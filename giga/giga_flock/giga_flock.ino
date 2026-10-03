@@ -445,6 +445,14 @@ void setup()
     backlight_set_step_us(step);
     backlight_set(pct);
     ui_backlight_refresh();
+    // Logged, not just printed: the USB console is not attached at boot, so the
+    // banner is unobservable in practice. This row is how we tell a genuine
+    // restore from a silent fallback to the default after the fact.
+    {
+      char nb[72];
+      snprintf(nb, sizeof(nb), "%u%% step %luus", (unsigned)pct, (unsigned long)step);
+      if (g_logReady) storage_append_note("#BL", restored ? "restored" : "default", nb);
+    }
     Serial.print(restored ? "[giga] backlight restored: " : "[giga] backlight default: ");
     Serial.print(pct);
     Serial.print("% ");

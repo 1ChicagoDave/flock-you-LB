@@ -219,17 +219,37 @@ struct BlRec { char magic[4]; uint8_t pct; uint8_t pad[3]; uint32_t stepUs; };
 bool storage_save_backlight(uint8_t pct, uint32_t stepUs)
 {
   if (!s_ready || pct > 100) return false;
-  FILE *f = fopen(BLT_PATH, "wb");
-  if (!f) return false;
+
   BlRec r;
   memcpy(r.magic, "FYB2", 4);          // FYBL = older, level-only layout
   r.pct = pct;
   r.pad[0] = r.pad[1] = r.pad[2] = 0;
   r.stepUs = stepUs;
+
+  // "r+b" FIRST, so an existing file is overwritten IN PLACE. "wb" truncates,
+  // which frees the cluster chain and reallocates it, and that FAT churn was
+  // losing the setting: measured 2026-10-03, the level survived resets taken
+  // seconds after a save but was gone on the two taken minutes later, falling
+  // back to the 100% default. The record is fixed size, so an in-place rewrite
+  // changes no metadata at all. "wb" is only the create path.
+  FILE *f = fopen(BLT_PATH, "r+b");
+  if (!f) f = fopen(BLT_PATH, "wb");
+  if (!f) return false;
   bool ok = (fwrite(&r, sizeof(r), 1, f) == 1);
   fflush(f);
   if (fclose(f) != 0) ok = false;              // close = commit to flash
-  return ok;
+  if (!ok) return false;
+
+  // Read it back. A save that silently did not stick is worse than a failed one,
+  // because the level looks held until the next power cycle throws it away.
+  BlRec v;
+  FILE *c = fopen(BLT_PATH, "rb");
+  if (!c) return false;
+  bool good = (fread(&v, sizeof(v), 1, c) == 1) &&
+              memcmp(v.magic, "FYB2", 4) == 0 &&
+              v.pct == pct && v.stepUs == stepUs;
+  fclose(c);
+  return good;
 }
 
 bool storage_load_backlight(uint8_t *pct, uint32_t *stepUs)
