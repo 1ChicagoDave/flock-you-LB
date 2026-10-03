@@ -62,6 +62,12 @@ void storage_clear_touchcal();
 bool storage_save_backlight(uint8_t pct, uint32_t stepUs);
 bool storage_load_backlight(uint8_t *pct, uint32_t *stepUs);
 
+// List /fs with file sizes, and hex-dump the backlight record. Ground truth for
+// "the setting did not persist": it separates a MISSING directory entry from a
+// file that is present but the wrong size or holds stale bytes. Those have
+// different causes and guessing between them has already cost several rebuilds.
+void storage_list_files();
+
 // Device-table snapshot so hit counts survive a reboot/power cycle.
 // save writes /fs/fy_table.bin; load restores g_dev / g_devCount / g_totalEvents.
 void storage_save_table();

@@ -34,3 +34,8 @@ void ui_nav_demo(bool on);
 // changing the level from outside the UI (boot restore, serial command), since
 // the button is built before the saved level has been read off flash.
 void ui_backlight_refresh();
+
+// Report the STATS layout fit measured at startup. Exposed because the result is
+// taken during ui_init(), when no USB console is attached yet, so printing it
+// there means nobody ever sees it.
+void ui_fit_report();

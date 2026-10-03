@@ -510,7 +510,7 @@ void setup()
 
 // Simple USB-serial console:  t = status,  d = dump the CSV log,
 // c = clear touch calibration,  x = toggle raw touch echo,  n = NAV demo soak,
-// b = cycle backlight brightness,  L = visible backlight pin test,
+// b = cycle backlight brightness,  i = list /fs + backlight record,  L = visible backlight pin test,
 // f = step backlight PWM frequency,  s = brightness sweep,  m = measure pad,
 // W = test hang.
 static void serialCmdTick()
@@ -521,6 +521,7 @@ static void serialCmdTick()
   {
     Serial.println("=== GIGA status ===");
     Serial.print("QSPI log   : "); Serial.println(g_logReady ? "READY" : "DISABLED (needs one-time QSPIFormat)");
+    ui_fit_report();
     Serial.print("backlight  : "); Serial.print(backlight_get());
     Serial.print("% "); Serial.print(backlight_label(backlight_get()));
     Serial.print("  step="); Serial.print((unsigned long)backlight_step_us());
@@ -570,6 +571,10 @@ static void serialCmdTick()
     Serial.print("[giga] backlight "); Serial.print(pct);
     Serial.print("% "); Serial.print(backlight_label(pct));
     Serial.println(saved ? "  (saved)" : "  (NOT saved)");
+  }
+  else if (c == 'i' || c == 'I')
+  {
+    storage_list_files();
   }
   else if (c == 's' || c == 'S')
   {

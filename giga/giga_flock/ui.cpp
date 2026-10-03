@@ -87,6 +87,7 @@ static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter;
 static lv_obj_t *blPct = nullptr, *blWord = nullptr;   // STATS brightness button
 static uint32_t  blSaveAt = 0;     // deferred flash write, 0 = nothing pending
 static uint32_t  blProbeAt = 0;    // deferred pad measurement after a tap
+static int32_t   statsUsedH = -1, statsAvailH = -1;   // STATS fit, see buildStats
 
 static lv_obj_t *liveList;              // flex container of row labels
 static uint32_t  lastLiveRebuild = 0;
@@ -507,6 +508,26 @@ static void buildStats()
   lv_obj_set_style_margin_top(hint, 8, 0);
 
   blSetLabels(backlight_get());
+
+  // ---- fit check ----
+  // Scrolling is OFF on this tab, which is what stopped the calibration button
+  // sitting half off the bottom of the screen. The flip side is that overflow is
+  // now SILENT: with no scrollbar there is nothing to hint that content ran past
+  // the end, and the bottom control would simply be unreachable. One more stat
+  // row is all it would take. So measure the real layout once at startup and say
+  // so plainly, instead of leaving the next person to find it by feel.
+  lv_obj_update_layout(tabStats);
+  int32_t availH = lv_obj_get_height(col);
+  int32_t usedH  = 0;
+  uint32_t kids  = lv_obj_get_child_count(col);
+  for (uint32_t i = 0; i < kids; i++)
+  {
+    lv_obj_t *ch = lv_obj_get_child(col, i);
+    int32_t bottom = lv_obj_get_y(ch) + lv_obj_get_height(ch);
+    if (bottom > usedH) usedH = bottom;
+  }
+  statsUsedH  = usedH;
+  statsAvailH = availH;
 }
 
 static void buildAlert()
@@ -1230,4 +1251,16 @@ void ui_tick(uint32_t now)
 
   nav_tick(now);
   cal_tick(now);
+}
+
+void ui_fit_report()
+{
+  if (statsAvailH < 0) { Serial.println("STATS fit  : not measured"); return; }
+  Serial.print("STATS fit  : uses "); Serial.print(statsUsedH);
+  Serial.print(" of "); Serial.print(statsAvailH);
+  Serial.print(" px, "); Serial.print(statsAvailH - statsUsedH);
+  Serial.print(" spare");
+  // Scrolling is disabled on this tab, so overflow is invisible on the screen -
+  // no scrollbar appears and the bottom control is simply unreachable.
+  Serial.println(statsUsedH > statsAvailH ? "  *** OVERFLOWING, BOTTOM ROWS CLIPPED ***" : "  (fits)");
 }

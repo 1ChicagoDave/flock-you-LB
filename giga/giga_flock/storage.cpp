@@ -226,12 +226,19 @@ bool storage_save_backlight(uint8_t pct, uint32_t stepUs)
   r.pad[0] = r.pad[1] = r.pad[2] = 0;
   r.stepUs = stepUs;
 
-  // "r+b" FIRST, so an existing file is overwritten IN PLACE. "wb" truncates,
-  // which frees the cluster chain and reallocates it, and that FAT churn was
-  // losing the setting: measured 2026-10-03, the level survived resets taken
-  // seconds after a save but was gone on the two taken minutes later, falling
-  // back to the 100% default. The record is fixed size, so an in-place rewrite
-  // changes no metadata at all. "wb" is only the create path.
+  // "r+b" FIRST, so an existing file is overwritten IN PLACE; "wb" is only the
+  // create path. The record is fixed size, so an in-place rewrite changes no
+  // directory metadata, which avoids the truncate-and-reallocate churn entirely.
+  //
+  // CORRECTION, and worth reading before trusting the git history here: an
+  // earlier version of this comment claimed that churn was observed LOSING the
+  // level. It was not. Dumping the record byte for byte (serial i) showed the
+  // file always present, always 12 bytes and always holding a VALID level. The
+  // boots that came up at 100% were restoring 100% correctly, because the button
+  // had been tapped round to DAY on the device between the save and the reset -
+  // the #BL,tap rows show exactly that, and all six logged boots read "restored",
+  // none "default". There was no persistence bug. Keeping the in-place write as
+  // cheap insurance, not as a fix for a confirmed fault.
   FILE *f = fopen(BLT_PATH, "r+b");
   if (!f) f = fopen(BLT_PATH, "wb");
   if (!f) return false;
@@ -267,6 +274,53 @@ bool storage_load_backlight(uint8_t *pct, uint32_t *stepUs)
   *pct    = r.pct;
   *stepUs = r.stepUs;
   return true;
+}
+
+// Sizes by name rather than a directory walk: this toolchain ships no working
+// <dirent.h>, and enumeration is not what is needed anyway. What matters is
+// whether a settings file is ABSENT, present but the WRONG SIZE, or present with
+// STALE bytes - three different causes that look identical from the outside.
+static void reportFile(const char *path)
+{
+  FILE *f = fopen(path, "rb");
+  Serial.print("      "); Serial.print(path); Serial.print("   ");
+  if (!f) { Serial.println("ABSENT"); return; }
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  fclose(f);
+  Serial.print(sz); Serial.println(" bytes");
+}
+
+void storage_list_files()
+{
+  if (!s_ready) { Serial.println("[fs] not mounted"); return; }
+  Serial.println("[fs] known files:");
+  reportFile(LOG_PATH);
+  reportFile(BLT_PATH);
+  reportFile(BLT_TMP);
+  reportFile(TCAL_PATH);
+  reportFile(TCAL_TMP);
+  // Literals: the snapshot defines live further down this file.
+  reportFile("/fs/fy_table.bin");
+  reportFile("/fs/fy_table.tmp");
+
+  // The backlight record byte for byte. Expect magic "FYB2" (46 59 42 32) then
+  // the level, then padding, then the PWM step period as a little-endian word.
+  Serial.print("[fs] backlight record = ");
+  FILE *b = fopen(BLT_PATH, "rb");
+  if (!b) { Serial.println("ABSENT"); return; }
+  uint8_t raw[16];
+  size_t n = fread(raw, 1, sizeof(raw), b);
+  fclose(b);
+  Serial.print(n); Serial.print(" bytes:");
+  for (size_t i = 0; i < n; i++)
+  {
+    Serial.print(" ");
+    if (raw[i] < 16) Serial.print("0");
+    Serial.print(raw[i], HEX);
+  }
+  Serial.print("   sizeof(BlRec)=");
+  Serial.println((int)sizeof(BlRec));
 }
 
 // ---- Device-table snapshot (survives reboot so hit counts persist) ----------
