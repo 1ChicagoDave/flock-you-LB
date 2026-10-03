@@ -86,6 +86,7 @@ static lv_obj_t *tabview;
 static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter;
 static lv_obj_t *blPct = nullptr, *blWord = nullptr;   // STATS brightness button
 static uint32_t  blSaveAt = 0;     // deferred flash write, 0 = nothing pending
+static uint32_t  blProbeAt = 0;    // deferred pad measurement after a tap
 
 static lv_obj_t *liveList;              // flex container of row labels
 static uint32_t  lastLiveRebuild = 0;
@@ -356,6 +357,13 @@ static void stats_bl_cb(lv_event_t *e)
   // Keep this handler cheap; ui_tick does the write once the taps stop.
   blSaveAt = millis() + BL_SAVE_DELAY_MS;
   if (blSaveAt == 0) blSaveAt = 1;             // 0 means "nothing pending"
+
+  // Measure the PAD shortly after the tap and log it. The button is reported as
+  // not dimming while the serial path does, and both call the same function, so
+  // this records what the pin was actually doing after a real touch rather than
+  // relying on the two paths being equivalent.
+  blProbeAt = millis() + 300;
+  if (blProbeAt == 0) blProbeAt = 1;
 
   audio_tick();                                // ~45 ms, deliberately kept
   // Guard runs from the END of the work, so whatever the handler cost is already
@@ -1199,11 +1207,25 @@ void ui_tick(uint32_t now)
     rebuildLiveList(now);
   }
 
+  // Deferred pad measurement after a brightness tap (diagnostic).
+  if (blProbeAt != 0 && (int32_t)(now - blProbeAt) >= 0)
+  {
+    blProbeAt = 0;
+    uint8_t want = backlight_get();
+    uint8_t got  = backlight_measure_duty();
+    char nb[72];
+    snprintf(nb, sizeof(nb), "tap set %u%% pad %u%% isr %lu step %luus",
+             (unsigned)want, (unsigned)got,
+             (unsigned long)backlight_isr_count(), (unsigned long)backlight_step_us());
+    Serial.print("[bl] "); Serial.println(nb);
+    if (g_logReady) storage_append_note("#BL", "tap", nb);
+  }
+
   // Deferred brightness write (see stats_bl_cb).
   if (blSaveAt != 0 && (int32_t)(now - blSaveAt) >= 0)
   {
     blSaveAt = 0;
-    if (g_logReady) storage_save_backlight(backlight_get());
+    if (g_logReady) storage_save_backlight(backlight_get(), backlight_step_us());
   }
 
   nav_tick(now);

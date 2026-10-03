@@ -214,35 +214,38 @@ void storage_clear_touchcal()
 // corruption window for removing a wide and demonstrated metadata window.
 #define BLT_PATH "/fs/backlight.bin"
 #define BLT_TMP  "/fs/backlight.tmp"          // legacy, still read on load
-struct BlRec { char magic[4]; uint8_t pct; uint8_t pad[3]; };
+struct BlRec { char magic[4]; uint8_t pct; uint8_t pad[3]; uint32_t stepUs; };
 
-bool storage_save_backlight(uint8_t pct)
+bool storage_save_backlight(uint8_t pct, uint32_t stepUs)
 {
   if (!s_ready || pct > 100) return false;
   FILE *f = fopen(BLT_PATH, "wb");
   if (!f) return false;
   BlRec r;
-  memcpy(r.magic, "FYBL", 4);
+  memcpy(r.magic, "FYB2", 4);          // FYBL = older, level-only layout
   r.pct = pct;
   r.pad[0] = r.pad[1] = r.pad[2] = 0;
+  r.stepUs = stepUs;
   bool ok = (fwrite(&r, sizeof(r), 1, f) == 1);
   fflush(f);
   if (fclose(f) != 0) ok = false;              // close = commit to flash
   return ok;
 }
 
-bool storage_load_backlight(uint8_t *pct)
+bool storage_load_backlight(uint8_t *pct, uint32_t *stepUs)
 {
-  if (!s_ready || !pct) return false;
+  if (!s_ready || !pct || !stepUs) return false;
   FILE *f = fopen(BLT_PATH, "rb");
   if (!f) f = fopen(BLT_TMP, "rb");            // left behind by the old scheme
   if (!f) return false;
   BlRec r;
   bool ok = (fread(&r, sizeof(r), 1, f) == 1) &&
-            memcmp(r.magic, "FYBL", 4) == 0 && r.pct <= 100;
+            memcmp(r.magic, "FYB2", 4) == 0 && r.pct <= 100 &&
+            r.stepUs >= 50 && r.stepUs <= 20000;
   fclose(f);
   if (!ok) return false;
-  *pct = r.pct;
+  *pct    = r.pct;
+  *stepUs = r.stepUs;
   return true;
 }
 

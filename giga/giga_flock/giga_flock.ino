@@ -439,14 +439,19 @@ void setup()
   // Saved backlight level. Without persistence this would reset to full on every
   // trip, because the device power-cycles whenever the ignition goes off.
   {
-    uint8_t pct = BL_DEFAULT_PCT;
-    bool restored = (g_logReady && storage_load_backlight(&pct));
+    uint8_t  pct  = BL_DEFAULT_PCT;
+    uint32_t step = BL_STEP_US_DEFAULT;
+    bool restored = (g_logReady && storage_load_backlight(&pct, &step));
+    backlight_set_step_us(step);
     backlight_set(pct);
     ui_backlight_refresh();
     Serial.print(restored ? "[giga] backlight restored: " : "[giga] backlight default: ");
     Serial.print(pct);
     Serial.print("% ");
-    Serial.println(backlight_label(pct));
+    Serial.print(backlight_label(pct));
+    Serial.print("  step="); Serial.print((unsigned long)step);
+    Serial.print("us pwm="); Serial.print(1000000UL / (step * 20));
+    Serial.println("Hz");
   }
 
   // Touch calibration from the STATS screen, if one has been saved.
@@ -553,10 +558,20 @@ static void serialCmdTick()
     // Same cycle the STATS button walks, reachable without touching the screen.
     uint8_t pct = backlight_cycle();
     ui_backlight_refresh();
-    bool saved = (g_logReady && storage_save_backlight(pct));
+    bool saved = (g_logReady && storage_save_backlight(pct, backlight_step_us()));
     Serial.print("[giga] backlight "); Serial.print(pct);
     Serial.print("% "); Serial.print(backlight_label(pct));
     Serial.println(saved ? "  (saved)" : "  (NOT saved)");
+  }
+  else if (c == 'm' || c == 'M')
+  {
+    // Configured level vs what the pad is really doing.
+    uint8_t want = backlight_get();
+    uint8_t got  = backlight_measure_duty();
+    Serial.print("[giga] level "); Serial.print(want);
+    Serial.print("%  pad measured "); Serial.print(got);
+    Serial.print("% high  step="); Serial.print((unsigned long)backlight_step_us());
+    Serial.print("us isr="); Serial.println((unsigned long)backlight_isr_count());
   }
   else if (c == 'L')
   {
@@ -572,9 +587,11 @@ static void serialCmdTick()
     uint32_t cur = backlight_step_us();
     uint32_t next = (cur >= 4000) ? 250 : cur * 2;
     backlight_set_step_us(next);
+    // Persisted: a frequency that actually dims this panel is worth keeping.
+    bool fsaved = (g_logReady && storage_save_backlight(backlight_get(), next));
     Serial.print("[giga] backlight PWM step "); Serial.print((unsigned long)next);
     Serial.print(" us = "); Serial.print(1000000UL / (next * 20));
-    Serial.println(" Hz");
+    Serial.println(fsaved ? " Hz (saved)" : " Hz (NOT saved)");
   }
   else if (c == 'n' || c == 'N')
   {

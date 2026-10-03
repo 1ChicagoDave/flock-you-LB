@@ -60,6 +60,16 @@
 // Applied the instant we boot, before the saved level can be read off QSPI
 // (a second or two). Deliberately the dimmest preset: a brief dim moment in
 // daylight costs nothing, a full-brightness flash at night is the complaint.
+// PWM step period in microseconds. 20 steps per cycle, so 500 us = 100 Hz.
+//
+// NOT 250 us / 200 Hz, which was the first choice and does not dim this panel AT
+// ALL. Measured 2026-10-03: the pad duty tracks the requested level exactly at
+// 200 Hz (100/55/30/15/5 requested read back as 100/54/29/14/5 on the pin) and
+// the backlight still sits at full brightness. The shield backlight converter is
+// driven on its enable pin and simply will not follow a switching signal that
+// fast. At 100 Hz it visibly dims. Field-reported, then confirmed on the pad.
+// Runtime-adjustable with serial f, and whatever is chosen is persisted.
+#define BL_STEP_US_DEFAULT 500
 #define BL_BOOT_PCT     5
 // Used when no level has been saved yet, or when the QSPI log is disabled.
 #define BL_DEFAULT_PCT  100

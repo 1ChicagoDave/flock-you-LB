@@ -56,8 +56,11 @@ void storage_clear_touchcal();
 // Display backlight level (0..100) persisted at /fs/backlight.bin. This has to
 // persist because the device power-cycles at every engine-off: without it the
 // screen would come back at full brightness on every single trip.
-bool storage_save_backlight(uint8_t pct);
-bool storage_load_backlight(uint8_t *pct);
+// stepUs is persisted alongside the level: this backlight only dims at certain
+// PWM frequencies, so a frequency dialled in with serial f has to survive the
+// power cycle that happens at every engine-off, exactly like the level does.
+bool storage_save_backlight(uint8_t pct, uint32_t stepUs);
+bool storage_load_backlight(uint8_t *pct, uint32_t *stepUs);
 
 // Device-table snapshot so hit counts survive a reboot/power cycle.
 // save writes /fs/fy_table.bin; load restores g_dev / g_devCount / g_totalEvents.

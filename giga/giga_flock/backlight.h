@@ -45,6 +45,14 @@ const char *backlight_label(uint8_t pct);
 void backlight_reassert();
 
 // ---- diagnostics ----
+// Measure what the PAD is actually doing, by sampling the GPIO input data
+// register for ~50 ms and returning the percentage of samples found high. IDR
+// reflects the real pad level regardless of how the pin is configured, so this
+// separates "we wrote the right duty" from "the write reached the pin" from "the
+// backlight ignored it". Blocks for 50 ms; well inside the 4 s hang watchdog.
+uint8_t backlight_measure_duty();
+
+
 // Times the PWM interrupt has fired. If this is not climbing while the level is
 // between the extremes, the Ticker is not running and the pin is simply stuck at
 // whatever it was last parked at, which looks exactly like "dimming does nothing".
