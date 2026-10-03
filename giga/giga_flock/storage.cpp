@@ -200,17 +200,26 @@ void storage_clear_touchcal()
 }
 
 // ---- Backlight level -------------------------------------------------------
-// Same temp+rename discipline as the touch calibration: the ignition can cut
-// power at any instant, and a truncated settings file must never read back as a
-// plausible level.
+// Written IN PLACE, deliberately NOT with the temp+rename dance the snapshot
+// uses. That was the first implementation and it lost the level on roughly one
+// reset in six, measured 2026-10-03: the file write itself commits on fclose,
+// but `remove` and `rename` are DIRECTORY operations whose metadata can sit in
+// the mbed FAT cache indefinitely. A reset then lands with PATH already removed
+// and the rename never committed, so BOTH names are gone and the level reads
+// back as absent. Elapsed time does not help; nothing flushes that cache.
+//
+// temp+rename exists to stop a half-written file from being mistaken for a good
+// one. For 8 bytes that risk is nearly nil and it is detectable anyway from the
+// magic and the 0..100 bound, so an in-place write trades a vanishingly narrow
+// corruption window for removing a wide and demonstrated metadata window.
 #define BLT_PATH "/fs/backlight.bin"
-#define BLT_TMP  "/fs/backlight.tmp"
+#define BLT_TMP  "/fs/backlight.tmp"          // legacy, still read on load
 struct BlRec { char magic[4]; uint8_t pct; uint8_t pad[3]; };
 
 bool storage_save_backlight(uint8_t pct)
 {
   if (!s_ready || pct > 100) return false;
-  FILE *f = fopen(BLT_TMP, "wb");
+  FILE *f = fopen(BLT_PATH, "wb");
   if (!f) return false;
   BlRec r;
   memcpy(r.magic, "FYBL", 4);
@@ -218,18 +227,15 @@ bool storage_save_backlight(uint8_t pct)
   r.pad[0] = r.pad[1] = r.pad[2] = 0;
   bool ok = (fwrite(&r, sizeof(r), 1, f) == 1);
   fflush(f);
-  if (fclose(f) != 0) ok = false;
-  if (!ok) { remove(BLT_TMP); return false; }
-  remove(BLT_PATH);
-  rename(BLT_TMP, BLT_PATH);
-  return true;
+  if (fclose(f) != 0) ok = false;              // close = commit to flash
+  return ok;
 }
 
 bool storage_load_backlight(uint8_t *pct)
 {
   if (!s_ready || !pct) return false;
   FILE *f = fopen(BLT_PATH, "rb");
-  if (!f) f = fopen(BLT_TMP, "rb");            // interrupted save
+  if (!f) f = fopen(BLT_TMP, "rb");            // left behind by the old scheme
   if (!f) return false;
   BlRec r;
   bool ok = (fread(&r, sizeof(r), 1, f) == 1) &&

@@ -14,6 +14,11 @@ static const uint8_t  BL_N = (uint8_t)(sizeof(BL_PRESETS) / sizeof(BL_PRESETS[0]
 // 20 steps x 250 us = 5 ms period = 200 Hz, 5% granularity. Well above the
 // frequency at which backlight dimming reads as flicker in peripheral vision,
 // which is the whole point of not reusing the stock 50 Hz class.
+// PB_12 as an Arduino pin number, for pinMode. Re-asserting the mode through the
+// Arduino API rather than deleting and re-creating the mbed DigitalOut avoids any
+// race against the PWM interrupt, which dereferences that object.
+#define BL_PIN_D    74
+
 #define BL_STEPS    20
 #define BL_STEP_US  250
 
@@ -23,14 +28,25 @@ static volatile uint8_t  s_duty = BL_STEPS;   // steps lit per period, 0..BL_STE
 static volatile uint8_t  s_step = 0;
 static uint8_t           s_pct  = BL_DEFAULT_PCT;
 static bool              s_running = false;
+static volatile uint32_t s_isrCount = 0;
+static uint32_t          s_stepUs = BL_STEP_US;
 
 // One register write and a counter bump. This fires 4000 times a second next to
 // the LTDC flush, the UART reads and LVGL, so it must stay trivial and must
 // never touch anything that can block or allocate.
 static void bl_isr()
 {
+  s_isrCount++;
   *s_pin = (s_step < s_duty) ? 1 : 0;
   if (++s_step >= BL_STEPS) s_step = 0;
+}
+
+// Park the pin at a fixed state WITHOUT disturbing the remembered level, so the
+// visible pin test can flash the panel and then hand control straight back.
+static void bl_park(int lit)
+{
+  if (s_running) { s_tick->detach(); s_running = false; }
+  if (s_pin) *s_pin = lit ? 1 : 0;
 }
 
 void backlight_begin(uint8_t pct)
@@ -63,7 +79,7 @@ void backlight_set(uint8_t pct)
   if (!s_running)
   {
     s_step = 0;
-    s_tick->attach(mbed::callback(bl_isr), std::chrono::microseconds(BL_STEP_US));
+    s_tick->attach(mbed::callback(bl_isr), std::chrono::microseconds(s_stepUs));
     s_running = true;
   }
 }
@@ -88,4 +104,66 @@ const char *backlight_label(uint8_t pct)
   for (uint8_t i = 0; i < BL_N; i++)
     if (BL_PRESETS[i] == pct) return BL_LABELS[i];
   return "custom";
+}
+
+void backlight_reassert()
+{
+  pinMode(BL_PIN_D, OUTPUT);
+  backlight_set(s_pct);        // re-applies duty and re-arms the Ticker
+}
+
+uint32_t backlight_isr_count() { return s_isrCount; }
+uint32_t backlight_step_us()   { return s_stepUs; }
+
+void backlight_set_step_us(uint32_t us)
+{
+  if (us < 50) us = 50;
+  s_stepUs = us;
+  // Re-apply so the Ticker is detached and re-attached at the new period.
+  uint8_t p = s_pct;
+  bl_park(1);
+  backlight_set(p);
+}
+
+// ---- visible pin test ----
+// Phases: dark, lit, dark, lit, restore. Long enough that any backlight which
+// this pin actually controls will visibly follow it.
+static uint8_t  s_testStep = 0;
+static uint32_t s_testNext = 0;
+
+void backlight_test_begin()
+{
+  s_testStep = 1;
+  s_testNext = millis();
+}
+
+bool backlight_test_active() { return s_testStep != 0; }
+
+bool backlight_test_tick(uint32_t now)
+{
+  if (s_testStep == 0) return false;
+  if ((int32_t)(now - s_testNext) < 0) return false;
+
+  switch (s_testStep)
+  {
+    case 1:
+    case 3:
+      bl_park(0);
+      Serial.println("[bl test] pin LOW  - screen should go DARK");
+      break;
+    case 2:
+    case 4:
+      bl_park(1);
+      Serial.println("[bl test] pin HIGH - screen should be LIT");
+      break;
+    default:
+      backlight_set(s_pct);          // hand control back to the saved level
+      Serial.print("[bl test] done. If the screen never changed, this pin does ");
+      Serial.println("not drive the backlight.");
+      s_testStep = 0;
+      return true;
+  }
+  s_testStep++;
+  s_testNext = now + 1200;
+  return false;
 }

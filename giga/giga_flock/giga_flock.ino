@@ -423,6 +423,12 @@ void setup()
 
   // Display.begin() initializes LVGL (lv_init) and registers the panel driver.
   Display.begin();
+
+  // Panel init reconfigures GPIO banks, which leaves the backlight pin no longer
+  // driving as an output: the dimmer kept running and the screen stayed at full
+  // brightness. Re-assert it here, after the display is up.
+  backlight_reassert();
+
   TouchDetector.begin();
   ui_init();                      // builds screens + registers touch indev
 
@@ -491,7 +497,8 @@ void setup()
 
 // Simple USB-serial console:  t = status,  d = dump the CSV log,
 // c = clear touch calibration,  x = toggle raw touch echo,  n = NAV demo soak,
-// b = cycle backlight brightness,
+// b = cycle backlight brightness,  L = visible backlight pin test,
+// f = step backlight PWM frequency,
 // W = test hang.
 static void serialCmdTick()
 {
@@ -502,7 +509,10 @@ static void serialCmdTick()
     Serial.println("=== GIGA status ===");
     Serial.print("QSPI log   : "); Serial.println(g_logReady ? "READY" : "DISABLED (needs one-time QSPIFormat)");
     Serial.print("backlight  : "); Serial.print(backlight_get());
-    Serial.print("% "); Serial.println(backlight_label(backlight_get()));
+    Serial.print("% "); Serial.print(backlight_label(backlight_get()));
+    Serial.print("  step="); Serial.print((unsigned long)backlight_step_us());
+    Serial.print("us pwm="); Serial.print(1000000UL / (backlight_step_us() * 20));
+    Serial.print("Hz isr="); Serial.println((unsigned long)backlight_isr_count());
     Serial.print("unique dev : "); Serial.println(g_devCount);
     Serial.print("events log : "); Serial.println((unsigned long)g_totalEvents);
     Serial.print("ESP32 link : "); Serial.println(g_link.everSeen ? "seen" : "never");
@@ -543,9 +553,28 @@ static void serialCmdTick()
     // Same cycle the STATS button walks, reachable without touching the screen.
     uint8_t pct = backlight_cycle();
     ui_backlight_refresh();
-    if (g_logReady) storage_save_backlight(pct);
+    bool saved = (g_logReady && storage_save_backlight(pct));
     Serial.print("[giga] backlight "); Serial.print(pct);
-    Serial.print("% "); Serial.println(backlight_label(pct));
+    Serial.print("% "); Serial.print(backlight_label(pct));
+    Serial.println(saved ? "  (saved)" : "  (NOT saved)");
+  }
+  else if (c == 'L')
+  {
+    // Visible proof of whether this pin drives the backlight at all.
+    Serial.println("[giga] backlight pin test: watch the screen for ~5 s");
+    backlight_test_begin();
+  }
+  else if (c == 'f' || c == 'F')
+  {
+    // Step the PWM period. If the interrupt is firing but nothing dims, the
+    // backlight converter is likely ignoring a short off-phase; slowing it down
+    // lengthens that phase until the panel actually responds.
+    uint32_t cur = backlight_step_us();
+    uint32_t next = (cur >= 4000) ? 250 : cur * 2;
+    backlight_set_step_us(next);
+    Serial.print("[giga] backlight PWM step "); Serial.print((unsigned long)next);
+    Serial.print(" us = "); Serial.print(1000000UL / (next * 20));
+    Serial.println(" Hz");
   }
   else if (c == 'n' || c == 'N')
   {
@@ -641,6 +670,7 @@ void loop()
   pollEsp32();          // parse ESP32 detection/status JSON
   pollGps();            // parse NMEA, refresh fix state
   ledTick(now);         // clear the class-color flash after LED_FLASH_MS
+  if (backlight_test_tick(now)) ui_backlight_refresh();
   ui_tick(now);         // refresh LVGL labels / LIVE list from global state
   serialCmdTick();      // USB-serial console (t=status, d=dump CSV)
   tableSaveTick(now);   // periodic device-table snapshot to QSPI

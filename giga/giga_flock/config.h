@@ -63,6 +63,14 @@
 #define BL_BOOT_PCT     5
 // Used when no level has been saved yet, or when the QSPI log is disabled.
 #define BL_DEFAULT_PCT  100
+// Ignore a second brightness tap inside this window, measured from the END of the
+// handler. One physical press can still reach LVGL as two clicks if the GT911
+// drops a frame mid-touch, and the handler must never be slow enough to push the
+// second one outside this window (see the deferred save in ui.cpp).
+#define BL_TAP_GUARD_MS 450
+// How long after the last tap the level is written to flash. Coalesces a run of
+// taps into one write and, critically, keeps QSPI I/O out of the touch handler.
+#define BL_SAVE_DELAY_MS 1200
 
 #define UI_TICK_MS     200      // label refresh cadence
 #define LIVE_REBUILD_MS 400     // min interval between LIVE list rebuilds

@@ -33,3 +33,35 @@ uint8_t backlight_cycle();
 
 // Short human label for a level, e.g. "NIGHT". Never returns null.
 const char *backlight_label(uint8_t pct);
+
+// Re-assert the pin as a plain output and re-apply the current level. MUST be
+// called after the display is initialised: bringing up the panel reconfigures
+// GPIO banks and leaves PB_12 no longer driving as a GPIO output, so every write
+// after that lands on a pad that ignores it. The symptom is brutal to diagnose
+// from the firmware side, because the PWM interrupt keeps firing at the right
+// rate and the level bookkeeping all reads correct while the panel stays at full
+// brightness. Note the Arduino video library also configures this pin only at the
+// very END of its init for the same reason.
+void backlight_reassert();
+
+// ---- diagnostics ----
+// Times the PWM interrupt has fired. If this is not climbing while the level is
+// between the extremes, the Ticker is not running and the pin is simply stuck at
+// whatever it was last parked at, which looks exactly like "dimming does nothing".
+uint32_t backlight_isr_count();
+
+// Current PWM step period in microseconds, and the matching period setter.
+// Runtime-adjustable because a backlight boost converter driven on its enable pin
+// may not follow a fast square wave at all: the output capacitor holds up across
+// a short off-phase and the panel never visibly dims. Lowering the frequency
+// lengthens the off-phase until the converter actually drops out.
+uint32_t backlight_step_us();
+void backlight_set_step_us(uint32_t us);
+
+// Slow visible pin test: parks the pin dark/lit in ~1.2 s phases so it is obvious
+// to the eye whether this pin controls the backlight at all. Non-blocking, so it
+// cannot trip the 4 s hang watchdog; drive it from loop(). Returns true on the
+// tick that finishes the test, so the caller can refresh the UI.
+void backlight_test_begin();
+bool backlight_test_tick(uint32_t now);
+bool backlight_test_active();

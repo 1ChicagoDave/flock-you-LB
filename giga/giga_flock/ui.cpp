@@ -85,6 +85,7 @@ static lv_obj_t *calRing = nullptr, *calDot = nullptr, *calMsg = nullptr;
 static lv_obj_t *tabview;
 static lv_obj_t *tabLive, *tabStats, *tabAlert, *tabHunter;
 static lv_obj_t *blPct = nullptr, *blWord = nullptr;   // STATS brightness button
+static uint32_t  blSaveAt = 0;     // deferred flash write, 0 = nothing pending
 
 static lv_obj_t *liveList;              // flex container of row labels
 static uint32_t  lastLiveRebuild = 0;
@@ -339,19 +340,27 @@ void ui_backlight_refresh()
 static void stats_bl_cb(lv_event_t *e)
 {
   (void)e;
-  // One tap, one step: ignore a repeat inside 400 ms (same guard the NAV
-  // Strength buttons use, for the same GT911 reason).
   static uint32_t lastMs = 0;
-  uint32_t m = millis();
-  if (m - lastMs < 400) return;
-  lastMs = m;
+  if (millis() - lastMs < BL_TAP_GUARD_MS) return;
 
   uint8_t pct = backlight_cycle();
   blSetLabels(pct);
-  // Written immediately. The device power-cycles at every engine-off, so a level
-  // held only in RAM would be lost before the next trip.
-  if (g_logReady) storage_save_backlight(pct);
-  audio_tick();
+
+  // The flash write is DEFERRED, and that is the whole point of this comment.
+  // storage_save_backlight does fopen/fwrite/fclose plus remove plus rename on
+  // QSPI FAT, which stalls the loop for long enough that LVGL stops polling the
+  // touch panel. When polling resumed, the finger was still down, so the SAME
+  // press arrived as a second click - and because the stall was longer than the
+  // tap guard, the second click passed it. Every tap therefore cycled two levels
+  // and beeped twice, with the flash write audible as the gap between beeps.
+  // Keep this handler cheap; ui_tick does the write once the taps stop.
+  blSaveAt = millis() + BL_SAVE_DELAY_MS;
+  if (blSaveAt == 0) blSaveAt = 1;             // 0 means "nothing pending"
+
+  audio_tick();                                // ~45 ms, deliberately kept
+  // Guard runs from the END of the work, so whatever the handler cost is already
+  // covered rather than eating into the window.
+  lastMs = millis();
 }
 
 static void register_touch()
@@ -1188,6 +1197,13 @@ void ui_tick(uint32_t now)
   {
     g_uiDirty = false;
     rebuildLiveList(now);
+  }
+
+  // Deferred brightness write (see stats_bl_cb).
+  if (blSaveAt != 0 && (int32_t)(now - blSaveAt) >= 0)
+  {
+    blSaveAt = 0;
+    if (g_logReady) storage_save_backlight(backlight_get());
   }
 
   nav_tick(now);
